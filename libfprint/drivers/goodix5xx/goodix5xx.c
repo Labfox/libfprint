@@ -1059,60 +1059,83 @@ err:
  *  FpImageDevice vfuncs
  * ================================================================== */
 
-/* Find the data/vendor interface and its bulk IN/OUT endpoints, exactly as
- * protocol.py does at connect time. */
+/* Find the interface exposing bulk IN/OUT endpoints, as protocol.py does at
+ * connect time.  We prefer a data/vendor-class interface but fall back to any
+ * interface that has a bulk IN + bulk OUT pair.  Everything enumerated is
+ * logged so a mismatch is diagnosable from the debug output. */
 static gboolean
 gd_discover_endpoints (FpiDeviceGoodix5xx *self, GError **error)
 {
   g_autoptr(GPtrArray) ifaces = NULL;
   guint i, j;
+  gboolean found = FALSE;
+  gboolean found_preferred = FALSE;
 
   ifaces = g_usb_device_get_interfaces (self->usb, error);
   if (!ifaces)
     return FALSE;
 
+  fp_dbg ("Enumerating %u interface(s)", ifaces->len);
+
   for (i = 0; i < ifaces->len; i++)
     {
       GUsbInterface *iface = g_ptr_array_index (ifaces, i);
       guint8 cls = g_usb_interface_get_class (iface);
+      guint8 num = g_usb_interface_get_number (iface);
+      gboolean preferred = (cls == GD_USB_CLASS_CDC_DATA ||
+                            cls == GD_USB_CLASS_VENDOR);
       GPtrArray *eps;
       guint8 ep_in = 0, ep_out = 0;
 
-      if (cls != GD_USB_CLASS_CDC_DATA && cls != GD_USB_CLASS_VENDOR)
-        continue;
-
       eps = g_usb_interface_get_endpoints (iface);
-      if (!eps)
-        continue;
+      fp_dbg ("  iface #%u class 0x%02x subclass 0x%02x proto 0x%02x, %u endpoint(s)",
+              num, cls, g_usb_interface_get_subclass (iface),
+              g_usb_interface_get_protocol (iface), eps ? eps->len : 0);
 
-      for (j = 0; j < eps->len; j++)
+      for (j = 0; eps && j < eps->len; j++)
         {
           GUsbEndpoint *ep = g_ptr_array_index (eps, j);
+          guint8 addr = g_usb_endpoint_get_address (ep);
+          guint8 kind = g_usb_endpoint_get_kind (ep);
+          gboolean is_in = (g_usb_endpoint_get_direction (ep) ==
+                            G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST);
 
-          if (g_usb_endpoint_get_kind (ep) != GD_USB_XFER_BULK)
+          fp_dbg ("    ep 0x%02x kind %u dir %s", addr, kind,
+                  is_in ? "IN" : "OUT");
+
+          if (kind != GD_USB_XFER_BULK)
             continue;
-
-          if (g_usb_endpoint_get_direction (ep) ==
-              G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST)
-            ep_in = g_usb_endpoint_get_address (ep);
+          if (is_in)
+            ep_in = addr;
           else
-            ep_out = g_usb_endpoint_get_address (ep);
+            ep_out = addr;
         }
 
-      if (ep_in && ep_out)
+      if (!ep_in || !ep_out)
+        continue;
+
+      /* Take the first match; upgrade to a preferred-class one if we find it. */
+      if (!found || (preferred && !found_preferred))
         {
-          self->iface = g_usb_interface_get_number (iface);
+          self->iface = num;
           self->ep_in = ep_in;
           self->ep_out = ep_out;
-          fp_dbg ("Using interface %u, bulk IN 0x%02x, bulk OUT 0x%02x",
-                  self->iface, self->ep_in, self->ep_out);
-          return TRUE;
+          found = TRUE;
+          found_preferred = preferred;
         }
     }
 
-  g_set_error_literal (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_NO_DEVICE,
-                       "No bulk data interface found on the device");
-  return FALSE;
+  if (!found)
+    {
+      g_set_error_literal (error, G_USB_DEVICE_ERROR,
+                           G_USB_DEVICE_ERROR_NO_DEVICE,
+                           "No interface with bulk IN+OUT endpoints found");
+      return FALSE;
+    }
+
+  fp_dbg ("Using interface %u, bulk IN 0x%02x, bulk OUT 0x%02x",
+          self->iface, self->ep_in, self->ep_out);
+  return TRUE;
 }
 
 static void
