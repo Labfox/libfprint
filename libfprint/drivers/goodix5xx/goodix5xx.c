@@ -44,6 +44,12 @@
 #define GD_SENSOR_WIDTH         88
 #define GD_SENSOR_HEIGHT        108
 
+/* Raster geometry of the decoded frame.  tool.write_pgm() groups the pixel
+ * stream into lines of length SENSOR_HEIGHT, so the actual raster is
+ * SENSOR_HEIGHT wide by SENSOR_WIDTH tall. */
+#define GD_IMAGE_WIDTH          GD_SENSOR_HEIGHT
+#define GD_IMAGE_HEIGHT         GD_SENSOR_WIDTH
+
 /* SENSOR_WIDTH * SENSOR_HEIGHT / 4 * 6 + 4 (see tool.decode_image) */
 #define GD_IMAGE_BYTES          ((GD_SENSOR_WIDTH * GD_SENSOR_HEIGHT / 4 * 6) + 4)
 
@@ -215,6 +221,21 @@ gd_send_cmd (FpiDeviceGoodix5xx *self, guint8 command,
 
   proto = gd_build_protocol (command, payload, payload_len, &proto_len);
   return gd_send_pack (self, GD_FLAGS_MESSAGE_PROTOCOL, proto, proto_len, error);
+}
+
+/* Discard any pending IN data so the next exchange starts in sync
+ * (goodix.py Device.empty_buffer). */
+static void
+gd_drain (FpiDeviceGoodix5xx *self)
+{
+  gsize actual;
+  GError *error = NULL;
+
+  while (g_usb_device_bulk_transfer (self->usb, GD_EP_IN, self->read_buf,
+                                     GD_READ_BUF_SIZE, &actual, 100,
+                                     NULL, &error))
+    ;                             /* keep reading until it times out / errors */
+  g_clear_error (&error);
 }
 
 /* Read one message pack.  Returns the pack payload in self->read_buf+4;
@@ -525,7 +546,7 @@ gd_op_check_psk (FpiDeviceGoodix5xx *self, gboolean *valid, GError **error)
   g_autofree guint8 *reply = NULL;
   gsize len = 0;
   guint8 payload[8];
-  guint32 psk_len;
+  guint32 psk_len, flags;
 
   /* preset_psk_read(0xbb020007): le32(flags) + le32(0) */
   payload[0] = 0x07; payload[1] = 0x00; payload[2] = 0x02; payload[3] = 0xbb;
@@ -538,6 +559,11 @@ gd_op_check_psk (FpiDeviceGoodix5xx *self, gboolean *valid, GError **error)
 
   *valid = FALSE;
   if (len < 9 || reply[0] != 0x00)
+    return TRUE;
+
+  /* check_psk() also requires the returned flags to match. */
+  flags = reply[1] | (reply[2] << 8) | (reply[3] << 16) | (reply[4] << 24);
+  if (flags != 0xbb020007)
     return TRUE;
 
   psk_len = reply[5] | (reply[6] << 8) | (reply[7] << 16) | (reply[8] << 24);
@@ -743,8 +769,8 @@ gd_op_get_image (FpiDeviceGoodix5xx *self, guint8 *out, gsize out_len,
 static FpImage *
 gd_decode_image (const guint8 *data, gsize len)
 {
-  FpImage *img = fp_image_new (GD_SENSOR_WIDTH, GD_SENSOR_HEIGHT);
-  guint npix = GD_SENSOR_WIDTH * GD_SENSOR_HEIGHT;
+  FpImage *img = fp_image_new (GD_IMAGE_WIDTH, GD_IMAGE_HEIGHT);
+  guint npix = GD_IMAGE_WIDTH * GD_IMAGE_HEIGHT;
   guint8 *out = img->data;
   guint p = 0;
   gsize i;
@@ -856,7 +882,11 @@ gd_full_init (FpiDeviceGoodix5xx *self, GError **error)
   g_autofree gchar *fw = NULL;
   gboolean psk_valid = FALSE;
 
-  gd_op_nop (self, NULL);        /* best effort, empties buffer */
+  /* goodix.py Device.__init__: empty_buffer() then nop().  Drain again after
+   * the NOP so its (checksum-less) ACK cannot desync the next exchange. */
+  gd_drain (self);
+  gd_op_nop (self, NULL);
+  gd_drain (self);
 
   if (!gd_op_firmware_version (self, &fw, error))
     return FALSE;
@@ -879,6 +909,15 @@ gd_full_init (FpiDeviceGoodix5xx *self, GError **error)
       fp_dbg ("PSK not set, writing whitebox PSK");
       if (!gd_op_write_psk (self, error))
         return FALSE;
+      /* write_psk() re-reads the PSK to confirm it took. */
+      if (!gd_op_check_psk (self, &psk_valid, error))
+        return FALSE;
+      if (!psk_valid)
+        {
+          g_set_error_literal (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                               "PSK verification failed after write");
+          return FALSE;
+        }
     }
 
   if (!gd_op_reset (self, error))
@@ -1078,7 +1117,7 @@ fpi_device_goodix5xx_class_init (FpiDeviceGoodix5xxClass *klass)
   img_class->activate = dev_activate;
   img_class->deactivate = dev_deactivate;
 
-  img_class->img_width = GD_SENSOR_WIDTH;
-  img_class->img_height = GD_SENSOR_HEIGHT;
+  img_class->img_width = GD_IMAGE_WIDTH;
+  img_class->img_height = GD_IMAGE_HEIGHT;
   img_class->bz3_threshold = 24;
 }
