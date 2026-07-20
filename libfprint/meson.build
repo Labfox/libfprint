@@ -147,6 +147,8 @@ driver_sources = {
         [ 'drivers/synaptics/synaptics.c', 'drivers/synaptics/bmkt_message.c' ],
     'goodixmoc' :
         [ 'drivers/goodixmoc/goodix.c', 'drivers/goodixmoc/goodix_proto.c' ],
+    'goodix5xx' :
+        [ 'drivers/goodix5xx/goodix5xx.c' ],
     'fpcmoc' :
         [ 'drivers/fpcmoc/fpc.c' ],
     'realtek' :
@@ -163,6 +165,8 @@ helper_sources = {
     'aes3k' :
         [ 'drivers/aes3k.c' ],
     'openssl' :
+        [ ],
+    'gnutls' :
         [ ],
     'udev' :
         [ ],

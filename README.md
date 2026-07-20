@@ -4,6 +4,12 @@
 
 # LibFPrint
 
+This is an experimental libfprint driver implementation for Goodix drivers.
+
+Currently in the works:
+- 27c6x5110 (80x64 resolution)
+- 27c6x55a4 (88x108 resolution, TLS)
+
 *LibFPrint is part of the **[FPrint][Website]** project.*
 
 <br/>
@@ -46,12 +52,6 @@ We include **Bozorth3** from the **[US Export Controlled]**
 distribution, which we have determined to be fine
 being shipped in an open source project.
 
-## Get in *touch*
-
- - [IRC] - `#fprint` @ `irc.oftc.net`
- - [Matrix] - `#fprint:matrix.org` bridged to the IRC channel
- - [MailingList] - low traffic, not much used these days
-
 <br/>
 
 <div align="right">
@@ -68,9 +68,6 @@ being shipped in an open source project.
 [Unsupported]: https://gitlab.freedesktop.org/libfprint/wiki/-/wikis/Unsupported-Devices
 [Supported]: https://fprint.freedesktop.org/supported-devices.html
 [Website]: https://fprint.freedesktop.org/
-[MailingList]: https://lists.freedesktop.org/mailman/listinfo/fprint
-[IRC]: ircs://irc.oftc.net:6697/#fprint
-[Matrix]: https://matrix.to/#/#fprint:matrix.org
 
 [Contribute]: ./HACKING.md
 [License]: ./COPYING

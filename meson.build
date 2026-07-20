@@ -140,6 +140,7 @@ default_drivers = [
     'upeksonly',
     'upekts',
     'goodixmoc',
+    'goodix5xx',
     'nb1010',
     'fpcmoc',
     'realtek',
@@ -210,6 +211,7 @@ driver_helper_mapping = {
     'aes3500' : [ 'aeslib', 'aes3k' ],
     'aes4000' : [ 'aeslib', 'aes3k' ],
     'uru4000' : [ 'openssl' ],
+    'goodix5xx' : [ 'gnutls' ],
     'elanspi' : [ 'udev' ],
     'virtual_image'          : [ 'virtual' ],
     'virtual_device'         : [ 'virtual' ],
@@ -273,6 +275,13 @@ foreach i : driver_helpers
         endif
 
         optional_deps += openssl_dep
+    elif i == 'gnutls'
+        gnutls_dep = dependency('gnutls', required: false)
+        if not gnutls_dep.found()
+            error('gnutls is required for @0@ and possibly others'.format(driver))
+        endif
+
+        optional_deps += gnutls_dep
     elif i == 'udev'
         install_udev_rules = true
 
