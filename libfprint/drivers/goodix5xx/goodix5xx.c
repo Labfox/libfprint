@@ -38,7 +38,6 @@
  * open time (protocol.py does the same), and stored on the device. */
 #define GD_USB_CLASS_CDC_DATA   0x0a
 #define GD_USB_CLASS_VENDOR     0xff
-#define GD_USB_XFER_BULK        0x02    /* g_usb_endpoint_get_kind() */
 
 #define GD_SENSOR_WIDTH         88
 #define GD_SENSOR_HEIGHT        108
@@ -1096,15 +1095,15 @@ gd_discover_endpoints (FpiDeviceGoodix5xx *self, GError **error)
         {
           GUsbEndpoint *ep = g_ptr_array_index (eps, j);
           guint8 addr = g_usb_endpoint_get_address (ep);
-          guint8 kind = g_usb_endpoint_get_kind (ep);
           gboolean is_in = (g_usb_endpoint_get_direction (ep) ==
                             G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST);
 
-          fp_dbg ("    ep 0x%02x kind %u dir %s", addr, kind,
-                  is_in ? "IN" : "OUT");
+          fp_dbg ("    ep 0x%02x dir %s", addr, is_in ? "IN" : "OUT");
 
-          if (kind != GD_USB_XFER_BULK)
-            continue;
+          /* gusb does not expose the transfer type (get_kind returns the
+           * descriptor type, always 0x05), so we select purely by direction;
+           * the goodix data interface carries exactly one bulk IN and one
+           * bulk OUT endpoint. */
           if (is_in)
             ep_in = addr;
           else
