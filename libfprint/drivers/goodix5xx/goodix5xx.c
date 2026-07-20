@@ -520,12 +520,11 @@ gd_tls_handshake (FpiDeviceGoodix5xx *self, GError **error)
    * GnuTLS versions).  The device is a TLS 1.2 PSK client. */
   {
     /* The device offers exactly one suite: TLS_PSK_WITH_AES_128_CBC_SHA256
-     * (0x00AE) with no extensions.  Offer precisely that and keep the
-     * ServerHello plain (no tickets / EMS / EtM / safe-reneg extension),
-     * matching the openssl reference. */
+     * (0x00AE) and signals the renegotiation SCSV (0x00FF), so per RFC 5746
+     * it requires the renegotiation_info extension echoed back.  Keep safe
+     * renegotiation enabled (do NOT disable it), matching openssl. */
     const char *prio =
-      "NONE:+VERS-TLS1.2:+PSK:+AES-128-CBC:+SHA256:+SIGN-ALL:+COMP-NULL:"
-      "%NO_TICKETS:%NO_SESSION_HASH:%DISABLE_SAFE_RENEGOTIATION:%COMPAT";
+      "NONE:+VERS-TLS1.2:+PSK:+AES-128-CBC:+SHA256:+SIGN-ALL:+COMP-NULL";
     const char *errpos = NULL;
 
     ret = gnutls_priority_set_direct (self->tls_session, prio, &errpos);
