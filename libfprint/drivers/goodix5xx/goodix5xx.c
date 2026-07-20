@@ -470,6 +470,25 @@ gd_tls_pull (gnutls_transport_ptr_t ptr, void *data, size_t len)
   }
 }
 
+/* Dump the device's ClientHello so its offered ciphersuites / extensions are
+ * visible in the debug log. */
+static int
+gd_tls_hook (gnutls_session_t session, unsigned int htype, unsigned when,
+             unsigned int incoming, const gnutls_datum_t *msg)
+{
+  if (htype == GNUTLS_HANDSHAKE_CLIENT_HELLO && incoming && msg && msg->size)
+    {
+      GString *hex = g_string_new (NULL);
+      unsigned int i;
+
+      for (i = 0; i < msg->size; i++)
+        g_string_append_printf (hex, "%02x", msg->data[i]);
+      fp_dbg ("ClientHello (%u bytes): %s", msg->size, hex->str);
+      g_string_free (hex, TRUE);
+    }
+  return 0;
+}
+
 static int
 gd_tls_psk_creds_cb (gnutls_session_t session, const char *username,
                      gnutls_datum_t *key)
@@ -506,7 +525,11 @@ gd_tls_handshake (FpiDeviceGoodix5xx *self, GError **error)
       "NONE:+VERS-TLS1.2:+PSK:+ECDHE-PSK:+DHE-PSK:"
       "+AES-128-GCM:+AES-256-GCM:+AES-128-CBC:+AES-256-CBC:"
       "+AEAD:+SHA256:+SHA384:+SHA1:"
-      "+CURVE-ALL:+GROUP-ALL:+SIGN-ALL:+COMP-NULL";
+      "+CURVE-ALL:+GROUP-ALL:+SIGN-ALL:+COMP-NULL:"
+      /* The device runs a minimal embedded TLS stack; keep the ServerHello
+       * plain (no session tickets, extended-master-secret, encrypt-then-mac,
+       * or safe-renegotiation extension), like the openssl reference. */
+      "%NO_TICKETS:%NO_SESSION_HASH:%DISABLE_SAFE_RENEGOTIATION:%COMPAT";
     const char *errpos = NULL;
 
     ret = gnutls_priority_set_direct (self->tls_session, prio, &errpos);
@@ -520,6 +543,10 @@ gd_tls_handshake (FpiDeviceGoodix5xx *self, GError **error)
   }
 
   gnutls_credentials_set (self->tls_session, GNUTLS_CRD_PSK, self->tls_creds);
+
+  gnutls_handshake_set_hook_function (self->tls_session,
+                                      GNUTLS_HANDSHAKE_CLIENT_HELLO,
+                                      GNUTLS_HOOK_POST, gd_tls_hook);
 
   gnutls_transport_set_ptr (self->tls_session, self);
   gnutls_transport_set_push_function (self->tls_session, gd_tls_push);
