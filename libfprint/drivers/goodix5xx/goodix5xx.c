@@ -920,16 +920,21 @@ gd_full_init (FpiDeviceGoodix5xx *self, GError **error)
         }
     }
 
+  fp_dbg ("init: reset");
   if (!gd_op_reset (self, error))
     return FALSE;
+  fp_dbg ("init: read chip id");
   if (!gd_op_read_sensor_register (self, 0x0000, 4, error))   /* chip id */
     return FALSE;
+  fp_dbg ("init: read otp");
   if (!gd_op_read_otp (self, error))
     return FALSE;
 
+  fp_dbg ("init: TLS handshake");
   if (!gd_tls_handshake (self, error))
     return FALSE;
 
+  fp_dbg ("init: upload config");
   if (!gd_op_upload_config (self, error))
     return FALSE;
 
@@ -939,11 +944,13 @@ gd_full_init (FpiDeviceGoodix5xx *self, GError **error)
   {
     g_autofree guint8 *clear = g_malloc0 (GD_IMAGE_BYTES);
 
+    fp_dbg ("init: fdt mode + clear frame 0");
     if (!gd_op_fdt_mode (self, error))
       return FALSE;
     if (!gd_op_get_image (self, clear, GD_IMAGE_BYTES, error))     /* clear-0 */
       return FALSE;
 
+    fp_dbg ("init: fdt mode + idle + clear frame 1");
     if (!gd_op_fdt_mode (self, error))
       return FALSE;
     if (!gd_op_idle_mode (self, 20, error))
@@ -953,11 +960,13 @@ gd_full_init (FpiDeviceGoodix5xx *self, GError **error)
     if (!gd_op_get_image (self, clear, GD_IMAGE_BYTES, error))     /* clear-1 */
       return FALSE;
 
+    fp_dbg ("init: fdt mode + sleep");
     if (!gd_op_fdt_mode (self, error))
       return FALSE;
     if (!gd_op_switch_to_sleep (self, 0x6c, error))
       return FALSE;
   }
+  fp_dbg ("init: done");
 
   return TRUE;
 }
@@ -1028,6 +1037,17 @@ gd_worker (gpointer data)
   return NULL;
 
 err:
+  /* libfprint discards (and replaces with a generic message) any error that
+   * is not in the FpDeviceError / FpDeviceRetry domain, which would hide the
+   * real cause.  Re-wrap while preserving the original message. */
+  if (error &&
+      error->domain != FP_DEVICE_ERROR && error->domain != FP_DEVICE_RETRY)
+    {
+      GError *wrapped = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                  "%s", error->message);
+      g_error_free (error);
+      error = wrapped;
+    }
   gd_marshal (self, gd_idle_session_error, NULL, error);
   return NULL;
 }
