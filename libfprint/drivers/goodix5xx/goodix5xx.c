@@ -34,12 +34,11 @@
  *  Device constants (driver_55x4.py)
  * ------------------------------------------------------------------ */
 
-/* USB endpoints. These are not expressed in the python reference (which
- * discovers them from the descriptors); they are the well known bulk
- * endpoints of the Goodix 5xx family. */
-#define GD_EP_OUT               (0x01 | FPI_USB_ENDPOINT_OUT)
-#define GD_EP_IN                (0x03 | FPI_USB_ENDPOINT_IN)
-#define GD_INTERFACE            0x00
+/* The interface and bulk endpoints are discovered from the descriptors at
+ * open time (protocol.py does the same), and stored on the device. */
+#define GD_USB_CLASS_CDC_DATA   0x0a
+#define GD_USB_CLASS_VENDOR     0xff
+#define GD_USB_XFER_BULK        0x02    /* g_usb_endpoint_get_kind() */
 
 #define GD_SENSOR_WIDTH         88
 #define GD_SENSOR_HEIGHT        108
@@ -128,6 +127,10 @@ struct _FpiDeviceGoodix5xx
   GUsbDevice               *usb;
   guint8                   *read_buf;      /* GD_READ_BUF_SIZE */
 
+  guint8                    iface;         /* claimed interface number */
+  guint8                    ep_in;         /* bulk IN endpoint address */
+  guint8                    ep_out;        /* bulk OUT endpoint address */
+
   /* TLS */
   gnutls_session_t          tls_session;
   gnutls_psk_server_credentials_t tls_creds;
@@ -194,7 +197,7 @@ static gboolean
 gd_usb_write (FpiDeviceGoodix5xx *self, const guint8 *data, gsize len,
               GError **error)
 {
-  return g_usb_device_bulk_transfer (self->usb, GD_EP_OUT,
+  return g_usb_device_bulk_transfer (self->usb, self->ep_out,
                                      (guint8 *) data, len, NULL,
                                      GD_USB_TIMEOUT, NULL, error);
 }
@@ -231,7 +234,7 @@ gd_drain (FpiDeviceGoodix5xx *self)
   gsize actual;
   GError *error = NULL;
 
-  while (g_usb_device_bulk_transfer (self->usb, GD_EP_IN, self->read_buf,
+  while (g_usb_device_bulk_transfer (self->usb, self->ep_in, self->read_buf,
                                      GD_READ_BUF_SIZE, &actual, 100,
                                      NULL, &error))
     ;                             /* keep reading until it times out / errors */
@@ -247,7 +250,7 @@ gd_read_pack (FpiDeviceGoodix5xx *self, guint timeout, guint8 *flags,
 {
   gsize actual = 0;
 
-  if (!g_usb_device_bulk_transfer (self->usb, GD_EP_IN, self->read_buf,
+  if (!g_usb_device_bulk_transfer (self->usb, self->ep_in, self->read_buf,
                                    GD_READ_BUF_SIZE, &actual, timeout,
                                    NULL, error))
     return NULL;
@@ -1056,6 +1059,62 @@ err:
  *  FpImageDevice vfuncs
  * ================================================================== */
 
+/* Find the data/vendor interface and its bulk IN/OUT endpoints, exactly as
+ * protocol.py does at connect time. */
+static gboolean
+gd_discover_endpoints (FpiDeviceGoodix5xx *self, GError **error)
+{
+  g_autoptr(GPtrArray) ifaces = NULL;
+  guint i, j;
+
+  ifaces = g_usb_device_get_interfaces (self->usb, error);
+  if (!ifaces)
+    return FALSE;
+
+  for (i = 0; i < ifaces->len; i++)
+    {
+      GUsbInterface *iface = g_ptr_array_index (ifaces, i);
+      guint8 cls = g_usb_interface_get_class (iface);
+      GPtrArray *eps;
+      guint8 ep_in = 0, ep_out = 0;
+
+      if (cls != GD_USB_CLASS_CDC_DATA && cls != GD_USB_CLASS_VENDOR)
+        continue;
+
+      eps = g_usb_interface_get_endpoints (iface);
+      if (!eps)
+        continue;
+
+      for (j = 0; j < eps->len; j++)
+        {
+          GUsbEndpoint *ep = g_ptr_array_index (eps, j);
+
+          if (g_usb_endpoint_get_kind (ep) != GD_USB_XFER_BULK)
+            continue;
+
+          if (g_usb_endpoint_get_direction (ep) ==
+              G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST)
+            ep_in = g_usb_endpoint_get_address (ep);
+          else
+            ep_out = g_usb_endpoint_get_address (ep);
+        }
+
+      if (ep_in && ep_out)
+        {
+          self->iface = g_usb_interface_get_number (iface);
+          self->ep_in = ep_in;
+          self->ep_out = ep_out;
+          fp_dbg ("Using interface %u, bulk IN 0x%02x, bulk OUT 0x%02x",
+                  self->iface, self->ep_in, self->ep_out);
+          return TRUE;
+        }
+    }
+
+  g_set_error_literal (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_NO_DEVICE,
+                       "No bulk data interface found on the device");
+  return FALSE;
+}
+
 static void
 dev_open (FpImageDevice *dev)
 {
@@ -1065,7 +1124,13 @@ dev_open (FpImageDevice *dev)
   self->usb = fpi_device_get_usb_device (FP_DEVICE (dev));
   self->read_buf = g_malloc0 (GD_READ_BUF_SIZE);
 
-  if (!g_usb_device_claim_interface (self->usb, GD_INTERFACE, 0, &error))
+  if (!gd_discover_endpoints (self, &error))
+    {
+      fpi_image_device_open_complete (dev, error);
+      return;
+    }
+
+  if (!g_usb_device_claim_interface (self->usb, self->iface, 0, &error))
     {
       fpi_image_device_open_complete (dev, error);
       return;
@@ -1083,7 +1148,7 @@ dev_close (FpImageDevice *dev)
   gd_tls_deinit (self);
   g_clear_pointer (&self->read_buf, g_free);
 
-  g_usb_device_release_interface (self->usb, GD_INTERFACE, 0, &error);
+  g_usb_device_release_interface (self->usb, self->iface, 0, &error);
 
   fpi_image_device_close_complete (dev, error);
 }
