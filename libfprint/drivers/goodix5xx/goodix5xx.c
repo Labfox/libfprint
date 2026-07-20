@@ -139,6 +139,12 @@ struct _FpiDeviceGoodix5xx
   guint8                   *pull_buf;
   gsize                     pull_len;
   gsize                     pull_pos;
+
+  /* GnuTLS push coalescing: each handshake flight is buffered and sent as a
+   * single message pack (the python reference wraps one openssl read into one
+   * pack). */
+  GByteArray               *push_buf;
+  gboolean                  push_error;
 };
 
 G_DEFINE_TYPE (FpiDeviceGoodix5xx, fpi_device_goodix5xx, FP_TYPE_IMAGE_DEVICE)
@@ -378,19 +384,31 @@ gd_exec_ack_only (FpiDeviceGoodix5xx *self, guint8 command,
  *  GnuTLS transport (host acts as PSK-TLS server, device is client)
  * ================================================================== */
 
+/* Send whatever push output has been buffered as a single message pack.
+ * Returns FALSE on USB failure. */
+static gboolean
+gd_tls_flush (FpiDeviceGoodix5xx *self, GError **error)
+{
+  gboolean ok = TRUE;
+
+  if (self->push_buf && self->push_buf->len)
+    {
+      fp_dbg ("TLS -> device: %u byte flight", self->push_buf->len);
+      ok = gd_send_pack (self, GD_FLAGS_TLS, self->push_buf->data,
+                         self->push_buf->len, error);
+      g_byte_array_set_size (self->push_buf, 0);
+    }
+  return ok;
+}
+
 static ssize_t
 gd_tls_push (gnutls_transport_ptr_t ptr, const void *data, size_t len)
 {
   FpiDeviceGoodix5xx *self = ptr;
-  GError *error = NULL;
 
-  if (!gd_send_pack (self, GD_FLAGS_TLS, data, len, &error))
-    {
-      fp_warn ("TLS push failed: %s", error->message);
-      g_clear_error (&error);
-      gnutls_transport_set_errno (self->tls_session, EIO);
-      return -1;
-    }
+  /* Accumulate; the flight is transmitted as one pack from gd_tls_pull /
+   * after the handshake. */
+  g_byte_array_append (self->push_buf, data, len);
   return len;
 }
 
@@ -398,6 +416,20 @@ static ssize_t
 gd_tls_pull (gnutls_transport_ptr_t ptr, void *data, size_t len)
 {
   FpiDeviceGoodix5xx *self = ptr;
+
+  /* gnutls wants to read: it has finished sending, so flush the flight. */
+  if (self->pull_pos >= self->pull_len && self->push_buf->len)
+    {
+      GError *error = NULL;
+      if (!gd_tls_flush (self, &error))
+        {
+          fp_warn ("TLS flush failed: %s", error->message);
+          g_clear_error (&error);
+          self->push_error = TRUE;
+          gnutls_transport_set_errno (self->tls_session, EIO);
+          return -1;
+        }
+    }
 
   if (self->pull_pos >= self->pull_len)
     {
@@ -414,6 +446,8 @@ gd_tls_pull (gnutls_transport_ptr_t ptr, void *data, size_t len)
           gnutls_transport_set_errno (self->tls_session, EIO);
           return -1;
         }
+
+      fp_dbg ("TLS <- device: pack flags 0x%02x, %zu bytes", flags, plen);
 
       /* 0xb0 packs carry raw TLS records; 0xb2 image-data packs prefix the
        * TLS record with a 9-byte header (see driver_55x4.py "[9:]"). */
@@ -456,6 +490,11 @@ gd_tls_handshake (FpiDeviceGoodix5xx *self, GError **error)
   gnutls_psk_allocate_server_credentials (&self->tls_creds);
   gnutls_psk_set_server_credentials_function (self->tls_creds,
                                               gd_tls_psk_creds_cb);
+
+  if (!self->push_buf)
+    self->push_buf = g_byte_array_new ();
+  g_byte_array_set_size (self->push_buf, 0);
+  self->push_error = FALSE;
 
   gnutls_init (&self->tls_session, GNUTLS_SERVER);
 
@@ -502,7 +541,13 @@ gd_tls_handshake (FpiDeviceGoodix5xx *self, GError **error)
       return FALSE;
     }
 
+  /* The final server flight (ChangeCipherSpec + Finished) is not followed by
+   * a pull, so flush it explicitly. */
+  if (!gd_tls_flush (self, error))
+    return FALSE;
+
   self->tls_ready = TRUE;
+  fp_dbg ("TLS handshake complete");
   return TRUE;
 }
 
@@ -526,6 +571,11 @@ gd_tls_deinit (FpiDeviceGoodix5xx *self)
     }
   g_clear_pointer (&self->pull_buf, g_free);
   self->pull_len = self->pull_pos = 0;
+  if (self->push_buf)
+    {
+      g_byte_array_free (self->push_buf, TRUE);
+      self->push_buf = NULL;
+    }
 }
 
 /* ================================================================== *
