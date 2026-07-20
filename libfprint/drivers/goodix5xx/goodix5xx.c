@@ -458,9 +458,28 @@ gd_tls_handshake (FpiDeviceGoodix5xx *self, GError **error)
                                               gd_tls_psk_creds_cb);
 
   gnutls_init (&self->tls_session, GNUTLS_SERVER);
-  gnutls_priority_set_direct (self->tls_session,
-                              "NORMAL:-VERS-TLS-ALL:+VERS-TLS1.2:"
-                              "-KX-ALL:+PSK:+ECDHE-PSK:+DHE-PSK", NULL);
+
+  /* Build the ciphersuite list explicitly from NONE so we know exactly which
+   * PSK suites are offered (a NORMAL:-KX-ALL:+PSK base yields none on some
+   * GnuTLS versions).  The device is a TLS 1.2 PSK client. */
+  {
+    const char *prio =
+      "NONE:+VERS-TLS1.2:+PSK:+ECDHE-PSK:+DHE-PSK:"
+      "+AES-128-GCM:+AES-256-GCM:+AES-128-CBC:+AES-256-CBC:"
+      "+AEAD:+SHA256:+SHA384:+SHA1:"
+      "+CURVE-ALL:+GROUP-ALL:+SIGN-ALL:+COMP-NULL";
+    const char *errpos = NULL;
+
+    ret = gnutls_priority_set_direct (self->tls_session, prio, &errpos);
+    if (ret < 0)
+      {
+        g_set_error (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                     "TLS priority error at '%s': %s",
+                     errpos ? errpos : "?", gnutls_strerror (ret));
+        return FALSE;
+      }
+  }
+
   gnutls_credentials_set (self->tls_session, GNUTLS_CRD_PSK, self->tls_creds);
 
   gnutls_transport_set_ptr (self->tls_session, self);
