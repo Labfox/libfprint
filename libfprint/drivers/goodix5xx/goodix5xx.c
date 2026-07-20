@@ -470,22 +470,20 @@ gd_tls_pull (gnutls_transport_ptr_t ptr, void *data, size_t len)
   }
 }
 
-/* Dump the device's ClientHello so its offered ciphersuites / extensions are
- * visible in the debug log. */
+/* Trace every handshake message (both directions) so the exact ServerHello /
+ * ClientHello bytes are visible in the debug log. */
 static int
 gd_tls_hook (gnutls_session_t session, unsigned int htype, unsigned when,
              unsigned int incoming, const gnutls_datum_t *msg)
 {
-  if (htype == GNUTLS_HANDSHAKE_CLIENT_HELLO && incoming && msg && msg->size)
-    {
-      GString *hex = g_string_new (NULL);
-      unsigned int i;
+  GString *hex = g_string_new (NULL);
+  unsigned int i;
 
-      for (i = 0; i < msg->size; i++)
-        g_string_append_printf (hex, "%02x", msg->data[i]);
-      fp_dbg ("ClientHello (%u bytes): %s", msg->size, hex->str);
-      g_string_free (hex, TRUE);
-    }
+  for (i = 0; msg && i < msg->size && i < 256; i++)
+    g_string_append_printf (hex, "%02x", msg->data[i]);
+  fp_dbg ("TLS handshake msg type %u %s (%u bytes): %s",
+          htype, incoming ? "IN" : "OUT", msg ? msg->size : 0, hex->str);
+  g_string_free (hex, TRUE);
   return 0;
 }
 
@@ -521,14 +519,12 @@ gd_tls_handshake (FpiDeviceGoodix5xx *self, GError **error)
    * PSK suites are offered (a NORMAL:-KX-ALL:+PSK base yields none on some
    * GnuTLS versions).  The device is a TLS 1.2 PSK client. */
   {
+    /* The device offers exactly one suite: TLS_PSK_WITH_AES_128_CBC_SHA256
+     * (0x00AE) with no extensions.  Offer precisely that and keep the
+     * ServerHello plain (no tickets / EMS / EtM / safe-reneg extension),
+     * matching the openssl reference. */
     const char *prio =
-      "NONE:+VERS-TLS1.2:+PSK:+ECDHE-PSK:+DHE-PSK:"
-      "+AES-128-GCM:+AES-256-GCM:+AES-128-CBC:+AES-256-CBC:"
-      "+AEAD:+SHA256:+SHA384:+SHA1:"
-      "+CURVE-ALL:+GROUP-ALL:+SIGN-ALL:+COMP-NULL:"
-      /* The device runs a minimal embedded TLS stack; keep the ServerHello
-       * plain (no session tickets, extended-master-secret, encrypt-then-mac,
-       * or safe-renegotiation extension), like the openssl reference. */
+      "NONE:+VERS-TLS1.2:+PSK:+AES-128-CBC:+SHA256:+SIGN-ALL:+COMP-NULL:"
       "%NO_TICKETS:%NO_SESSION_HASH:%DISABLE_SAFE_RENEGOTIATION:%COMPAT";
     const char *errpos = NULL;
 
@@ -544,8 +540,7 @@ gd_tls_handshake (FpiDeviceGoodix5xx *self, GError **error)
 
   gnutls_credentials_set (self->tls_session, GNUTLS_CRD_PSK, self->tls_creds);
 
-  gnutls_handshake_set_hook_function (self->tls_session,
-                                      GNUTLS_HANDSHAKE_CLIENT_HELLO,
+  gnutls_handshake_set_hook_function (self->tls_session, (unsigned int) -1,
                                       GNUTLS_HOOK_POST, gd_tls_hook);
 
   gnutls_transport_set_ptr (self->tls_session, self);
