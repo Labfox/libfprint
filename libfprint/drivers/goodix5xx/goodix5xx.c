@@ -498,8 +498,14 @@ gd_tls_handshake (FpiDeviceGoodix5xx *self, GError **error)
       return FALSE;
     }
 
+  /* Match the reference `openssl s_server` exactly: leave the maximum version
+   * at TLS 1.3 so OpenSSL, when the device (TLS 1.2 only, no supported_versions)
+   * makes it negotiate down to TLS 1.2, writes the RFC 8446 downgrade sentinel
+   * ("DOWNGRD\x01") into the last 8 bytes of ServerHello.random.  Capping the
+   * maximum at TLS 1.2 omits that sentinel, and the device's firmware rejects
+   * the resulting ServerHello (stays silent). */
   SSL_CTX_set_min_proto_version (self->tls_ctx, TLS1_2_VERSION);
-  SSL_CTX_set_max_proto_version (self->tls_ctx, TLS1_2_VERSION);
+  SSL_CTX_set_max_proto_version (self->tls_ctx, TLS1_3_VERSION);
   /* PSK-AES128-CBC-SHA256 (0x00AE) is the only suite the device offers; drop
    * the security level so OpenSSL keeps this non-forward-secret PSK suite. */
   SSL_CTX_set_security_level (self->tls_ctx, 0);
