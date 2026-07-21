@@ -53,7 +53,7 @@
 #define GD_IMAGE_BYTES          ((GD_SENSOR_WIDTH * GD_SENSOR_HEIGHT / 4 * 6) + 4)
 
 #define GD_USB_TIMEOUT          5000    /* ms */
-#define GD_TLS_FLIGHT_DELAY_US  50000   /* settle delay before a TLS flight */
+#define GD_USB_PACKET_SIZE      0x40    /* bulk wMaxPacketSize; writes are chunked to this */
 #define GD_FINGER_POLL_TIMEOUT  2000    /* ms */
 #define GD_READ_BUF_SIZE        0x10000
 
@@ -202,9 +202,23 @@ static gboolean
 gd_usb_write (FpiDeviceGoodix5xx *self, const guint8 *data, gsize len,
               GError **error)
 {
-  return g_usb_device_bulk_transfer (self->usb, self->ep_out,
-                                     (guint8 *) data, len, NULL,
-                                     GD_USB_TIMEOUT, NULL, error);
+  gsize off;
+
+  /* The device firmware requires each bulk-OUT transfer to be at most one
+   * wMaxPacketSize (0x40); the python reference writes `data[i:i+0x40]` in a
+   * loop.  A single larger transfer (e.g. the 128-byte ServerHello flight) is
+   * silently dropped -- the firmware only processes the first packet and then
+   * waits forever.  Split the (already 0x40-padded) buffer accordingly. */
+  for (off = 0; off < len; off += GD_USB_PACKET_SIZE)
+    {
+      gsize chunk = MIN ((gsize) GD_USB_PACKET_SIZE, len - off);
+
+      if (!g_usb_device_bulk_transfer (self->usb, self->ep_out,
+                                       (guint8 *) data + off, chunk, NULL,
+                                       GD_USB_TIMEOUT, NULL, error))
+        return FALSE;
+    }
+  return TRUE;
 }
 
 /* Send a raw message pack (flags + payload). */
@@ -399,16 +413,6 @@ gd_tls_flush (FpiDeviceGoodix5xx *self, GError **error)
 
   if (self->push_buf && self->push_buf->len)
     {
-      /* The device is USB-timing sensitive during the handshake: the python
-       * reference relays each flight through a separate `openssl s_server`
-       * process over a socket, which naturally inserts a few ms between the
-       * device emitting its ClientHello and receiving our ServerHello.  Our
-       * in-process OpenSSL turns the flight around in well under a
-       * millisecond, apparently before the firmware is ready to receive it,
-       * so it silently drops the ServerHello.  Insert a settle delay to
-       * emulate that relay latency (cf. the reference's "Important otherwise
-       * an USBTimeout error occur" sleep). */
-      g_usleep (GD_TLS_FLIGHT_DELAY_US);
       fp_dbg ("TLS -> device: %u byte flight", self->push_buf->len);
       ok = gd_send_pack (self, GD_FLAGS_TLS, self->push_buf->data,
                          self->push_buf->len, error);
