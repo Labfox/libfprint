@@ -53,6 +53,7 @@
 #define GD_IMAGE_BYTES          ((GD_SENSOR_WIDTH * GD_SENSOR_HEIGHT / 4 * 6) + 4)
 
 #define GD_USB_TIMEOUT          5000    /* ms */
+#define GD_TLS_FLIGHT_DELAY_US  50000   /* settle delay before a TLS flight */
 #define GD_FINGER_POLL_TIMEOUT  2000    /* ms */
 #define GD_READ_BUF_SIZE        0x10000
 
@@ -398,6 +399,16 @@ gd_tls_flush (FpiDeviceGoodix5xx *self, GError **error)
 
   if (self->push_buf && self->push_buf->len)
     {
+      /* The device is USB-timing sensitive during the handshake: the python
+       * reference relays each flight through a separate `openssl s_server`
+       * process over a socket, which naturally inserts a few ms between the
+       * device emitting its ClientHello and receiving our ServerHello.  Our
+       * in-process OpenSSL turns the flight around in well under a
+       * millisecond, apparently before the firmware is ready to receive it,
+       * so it silently drops the ServerHello.  Insert a settle delay to
+       * emulate that relay latency (cf. the reference's "Important otherwise
+       * an USBTimeout error occur" sleep). */
+      g_usleep (GD_TLS_FLIGHT_DELAY_US);
       fp_dbg ("TLS -> device: %u byte flight", self->push_buf->len);
       ok = gd_send_pack (self, GD_FLAGS_TLS, self->push_buf->data,
                          self->push_buf->len, error);
