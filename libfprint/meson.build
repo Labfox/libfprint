@@ -166,8 +166,6 @@ helper_sources = {
         [ 'drivers/aes3k.c' ],
     'openssl' :
         [ ],
-    'gnutls' :
-        [ ],
     'udev' :
         [ ],
     'virtual' :

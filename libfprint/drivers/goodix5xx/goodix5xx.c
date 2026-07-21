@@ -24,7 +24,8 @@
 #define FP_COMPONENT "goodix5xx"
 
 #include <string.h>
-#include <gnutls/gnutls.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 #include "drivers_api.h"
 #include "fpi-image.h"
@@ -130,21 +131,19 @@ struct _FpiDeviceGoodix5xx
   guint8                    ep_in;         /* bulk IN endpoint address */
   guint8                    ep_out;        /* bulk OUT endpoint address */
 
-  /* TLS */
-  gnutls_session_t          tls_session;
-  gnutls_psk_server_credentials_t tls_creds;
+  /* TLS.  The host acts as the PSK-TLS *server* and the device is the client,
+   * exactly like the python reference which shells out to `openssl s_server`.
+   * We use OpenSSL (not GnuTLS) so the ServerHello is byte-for-byte what the
+   * device's minimal TLS client expects -- most importantly an *empty*
+   * session_id, which GnuTLS cannot emit for a TLS 1.2 server. */
+  SSL_CTX                  *tls_ctx;
+  SSL                      *tls_ssl;
+  BIO                      *tls_net_bio;   /* our half of the BIO pair */
   gboolean                  tls_ready;
 
-  /* GnuTLS pull buffering (raw TLS bytes unwrapped from message packs) */
-  guint8                   *pull_buf;
-  gsize                     pull_len;
-  gsize                     pull_pos;
-
-  /* GnuTLS push coalescing: each handshake flight is buffered and sent as a
-   * single message pack (the python reference wraps one openssl read into one
-   * pack). */
+  /* Each handshake flight is buffered and sent as a single message pack (the
+   * python reference wraps one openssl read into one pack). */
   GByteArray               *push_buf;
-  gboolean                  push_error;
 };
 
 G_DEFINE_TYPE (FpiDeviceGoodix5xx, fpi_device_goodix5xx, FP_TYPE_IMAGE_DEVICE)
@@ -381,7 +380,13 @@ gd_exec_ack_only (FpiDeviceGoodix5xx *self, guint8 command,
 }
 
 /* ================================================================== *
- *  GnuTLS transport (host acts as PSK-TLS server, device is client)
+ *  OpenSSL transport (host acts as PSK-TLS server, device is client)
+ *
+ *  This mirrors the python reference, which runs `openssl s_server
+ *  -nocert -psk <32 zero bytes>`.  OpenSSL is driven with a BIO pair: the
+ *  SSL object talks to one half, and we shuttle bytes between the other
+ *  half (tls_net_bio) and the device's message packs.  Each outbound
+ *  handshake flight is coalesced into a single message pack.
  * ================================================================== */
 
 /* Send whatever push output has been buffered as a single message pack.
@@ -401,171 +406,167 @@ gd_tls_flush (FpiDeviceGoodix5xx *self, GError **error)
   return ok;
 }
 
-static ssize_t
-gd_tls_push (gnutls_transport_ptr_t ptr, const void *data, size_t len)
+/* Drain any TLS bytes OpenSSL has produced into the flight buffer. */
+static void
+gd_tls_pump (FpiDeviceGoodix5xx *self)
 {
-  FpiDeviceGoodix5xx *self = ptr;
+  char buf[4096];
+  int n;
 
-  /* Accumulate; the flight is transmitted as one pack from gd_tls_pull /
-   * after the handshake. */
-  g_byte_array_append (self->push_buf, data, len);
-  return len;
+  while ((n = BIO_read (self->tls_net_bio, buf, sizeof (buf))) > 0)
+    g_byte_array_append (self->push_buf, (const guint8 *) buf, n);
 }
 
-static ssize_t
-gd_tls_pull (gnutls_transport_ptr_t ptr, void *data, size_t len)
+/* Read one message pack from the device and feed its TLS payload to OpenSSL. */
+static gboolean
+gd_tls_feed (FpiDeviceGoodix5xx *self, GError **error)
 {
-  FpiDeviceGoodix5xx *self = ptr;
+  const guint8 *payload;
+  guint8 flags;
+  gsize plen;
+  gsize skip;
 
-  /* gnutls wants to read: it has finished sending, so flush the flight. */
-  if (self->pull_pos >= self->pull_len && self->push_buf->len)
-    {
-      GError *error = NULL;
-      if (!gd_tls_flush (self, &error))
-        {
-          fp_warn ("TLS flush failed: %s", error->message);
-          g_clear_error (&error);
-          self->push_error = TRUE;
-          gnutls_transport_set_errno (self->tls_session, EIO);
-          return -1;
-        }
-    }
+  payload = gd_read_pack (self, GD_USB_TIMEOUT, &flags, &plen, error);
+  if (!payload)
+    return FALSE;
 
-  if (self->pull_pos >= self->pull_len)
-    {
-      GError *error = NULL;
-      const guint8 *payload;
-      guint8 flags;
-      gsize plen;
-      gsize skip;
+  fp_dbg ("TLS <- device: pack flags 0x%02x, %zu bytes", flags, plen);
 
-      payload = gd_read_pack (self, GD_USB_TIMEOUT, &flags, &plen, &error);
-      if (!payload)
-        {
-          g_clear_error (&error);
-          gnutls_transport_set_errno (self->tls_session, EIO);
-          return -1;
-        }
+  /* 0xb0 packs carry raw TLS records; 0xb2 image-data packs prefix the
+   * TLS record with a 9-byte header (see driver_55x4.py "[9:]"). */
+  skip = (flags == GD_FLAGS_TLS_DATA) ? 9 : 0;
+  if (plen < skip)
+    plen = skip;
 
-      fp_dbg ("TLS <- device: pack flags 0x%02x, %zu bytes", flags, plen);
-
-      /* 0xb0 packs carry raw TLS records; 0xb2 image-data packs prefix the
-       * TLS record with a 9-byte header (see driver_55x4.py "[9:]"). */
-      skip = (flags == GD_FLAGS_TLS_DATA) ? 9 : 0;
-      if (plen < skip)
-        plen = skip;
-
-      g_free (self->pull_buf);
-      self->pull_len = plen - skip;
-      self->pull_buf = g_memdup2 (payload + skip, self->pull_len);
-      self->pull_pos = 0;
-    }
-
-  {
-    gsize avail = self->pull_len - self->pull_pos;
-    gsize n = MIN (avail, len);
-    memcpy (data, self->pull_buf + self->pull_pos, n);
-    self->pull_pos += n;
-    return n;
-  }
+  if (plen > skip)
+    BIO_write (self->tls_net_bio, payload + skip, (int) (plen - skip));
+  return TRUE;
 }
 
-/* Trace every handshake message (both directions) so the exact ServerHello /
+/* Trace every TLS record (both directions) so the exact ServerHello /
  * ClientHello bytes are visible in the debug log. */
-static int
-gd_tls_hook (gnutls_session_t session, unsigned int htype, unsigned when,
-             unsigned int incoming, const gnutls_datum_t *msg)
+static void
+gd_tls_msg_cb (int write_p, int version, int content_type,
+               const void *buf, size_t len, SSL *ssl, void *arg)
 {
   GString *hex = g_string_new (NULL);
-  unsigned int i;
+  const guint8 *b = buf;
+  size_t i;
 
-  for (i = 0; msg && i < msg->size && i < 256; i++)
-    g_string_append_printf (hex, "%02x", msg->data[i]);
-  fp_dbg ("TLS handshake msg type %u %s (%u bytes): %s",
-          htype, incoming ? "IN" : "OUT", msg ? msg->size : 0, hex->str);
+  for (i = 0; i < len && i < 256; i++)
+    g_string_append_printf (hex, "%02x", b[i]);
+  fp_dbg ("TLS msg %s ct=%d ver=0x%04x (%zu bytes): %s",
+          write_p ? "OUT" : "IN", content_type, version, len, hex->str);
   g_string_free (hex, TRUE);
-  return 0;
 }
 
-static int
-gd_tls_psk_creds_cb (gnutls_session_t session, const char *username,
-                     gnutls_datum_t *key)
+static unsigned int
+gd_tls_psk_server_cb (SSL *ssl, const char *identity, unsigned char *psk,
+                      unsigned int max_psk_len)
 {
-  key->data = gnutls_malloc (sizeof (GD_PSK));
-  if (!key->data)
-    return -1;
-  memcpy (key->data, GD_PSK, sizeof (GD_PSK));
-  key->size = sizeof (GD_PSK);
-  return 0;
+  if (max_psk_len < sizeof (GD_PSK))
+    return 0;
+  memcpy (psk, GD_PSK, sizeof (GD_PSK));
+  return sizeof (GD_PSK);
+}
+
+static void
+gd_tls_set_ossl_error (GError **error, const char *what)
+{
+  unsigned long e = ERR_peek_last_error ();
+  char ebuf[256] = "";
+
+  if (e)
+    ERR_error_string_n (e, ebuf, sizeof (ebuf));
+  g_set_error (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+               "%s: %s", what, e ? ebuf : "unknown error");
 }
 
 static gboolean
 gd_tls_handshake (FpiDeviceGoodix5xx *self, GError **error)
 {
-  int ret;
-
-  gnutls_psk_allocate_server_credentials (&self->tls_creds);
-  gnutls_psk_set_server_credentials_function (self->tls_creds,
-                                              gd_tls_psk_creds_cb);
+  BIO *internal_bio = NULL;
 
   if (!self->push_buf)
     self->push_buf = g_byte_array_new ();
   g_byte_array_set_size (self->push_buf, 0);
-  self->push_error = FALSE;
 
-  gnutls_init (&self->tls_session, GNUTLS_SERVER);
+  self->tls_ctx = SSL_CTX_new (TLS_server_method ());
+  if (!self->tls_ctx)
+    {
+      gd_tls_set_ossl_error (error, "SSL_CTX_new failed");
+      return FALSE;
+    }
 
-  /* Build the ciphersuite list explicitly from NONE so we know exactly which
-   * PSK suites are offered (a NORMAL:-KX-ALL:+PSK base yields none on some
-   * GnuTLS versions).  The device is a TLS 1.2 PSK client. */
-  {
-    /* The device offers exactly one suite: TLS_PSK_WITH_AES_128_CBC_SHA256
-     * (0x00AE) and signals the renegotiation SCSV (0x00FF), so per RFC 5746
-     * it requires the renegotiation_info extension echoed back.  Keep safe
-     * renegotiation enabled (do NOT disable it), matching openssl. */
-    const char *prio =
-      "NONE:+VERS-TLS1.2:+PSK:+AES-128-CBC:+SHA256:+SIGN-ALL:+COMP-NULL";
-    const char *errpos = NULL;
+  SSL_CTX_set_min_proto_version (self->tls_ctx, TLS1_2_VERSION);
+  SSL_CTX_set_max_proto_version (self->tls_ctx, TLS1_2_VERSION);
+  /* PSK-AES128-CBC-SHA256 (0x00AE) is the only suite the device offers; drop
+   * the security level so OpenSSL keeps this non-forward-secret PSK suite. */
+  SSL_CTX_set_security_level (self->tls_ctx, 0);
+  if (SSL_CTX_set_cipher_list (self->tls_ctx, "PSK-AES128-CBC-SHA256") != 1)
+    {
+      gd_tls_set_ossl_error (error, "SSL_CTX_set_cipher_list failed");
+      return FALSE;
+    }
+  SSL_CTX_set_psk_server_callback (self->tls_ctx, gd_tls_psk_server_cb);
 
-    ret = gnutls_priority_set_direct (self->tls_session, prio, &errpos);
-    if (ret < 0)
-      {
-        g_set_error (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
-                     "TLS priority error at '%s': %s",
-                     errpos ? errpos : "?", gnutls_strerror (ret));
-        return FALSE;
-      }
-  }
+  self->tls_ssl = SSL_new (self->tls_ctx);
+  if (!self->tls_ssl)
+    {
+      gd_tls_set_ossl_error (error, "SSL_new failed");
+      return FALSE;
+    }
+  SSL_set_accept_state (self->tls_ssl);
+  SSL_set_msg_callback (self->tls_ssl, gd_tls_msg_cb);
+  SSL_set_msg_callback_arg (self->tls_ssl, self);
 
-  gnutls_credentials_set (self->tls_session, GNUTLS_CRD_PSK, self->tls_creds);
-
-  gnutls_handshake_set_hook_function (self->tls_session, (unsigned int) -1,
-                                      GNUTLS_HOOK_POST, gd_tls_hook);
-
-  gnutls_transport_set_ptr (self->tls_session, self);
-  gnutls_transport_set_push_function (self->tls_session, gd_tls_push);
-  gnutls_transport_set_pull_function (self->tls_session, gd_tls_pull);
+  if (BIO_new_bio_pair (&internal_bio, 0, &self->tls_net_bio, 0) != 1)
+    {
+      gd_tls_set_ossl_error (error, "BIO_new_bio_pair failed");
+      return FALSE;
+    }
+  /* SSL takes ownership of internal_bio; tls_net_bio is freed separately. */
+  SSL_set_bio (self->tls_ssl, internal_bio, internal_bio);
 
   /* Tell the device to start its TLS client handshake. */
   if (!gd_exec_ack_only (self, GD_CMD_REQUEST_TLS_CONNECTION,
                          (const guint8 *) "\x00\x00", 2, error))
     return FALSE;
 
-  do
-    ret = gnutls_handshake (self->tls_session);
-  while (ret < 0 && gnutls_error_is_fatal (ret) == 0);
-
-  if (ret < 0)
+  for (;;)
     {
-      g_set_error (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
-                   "TLS handshake failed: %s", gnutls_strerror (ret));
-      return FALSE;
-    }
+      int ret = SSL_do_handshake (self->tls_ssl);
+      int err;
 
-  /* The final server flight (ChangeCipherSpec + Finished) is not followed by
-   * a pull, so flush it explicitly. */
-  if (!gd_tls_flush (self, error))
-    return FALSE;
+      gd_tls_pump (self);
+
+      if (ret == 1)
+        {
+          /* Final server flight (ChangeCipherSpec + Finished). */
+          if (!gd_tls_flush (self, error))
+            return FALSE;
+          break;
+        }
+
+      err = SSL_get_error (self->tls_ssl, ret);
+      if (err == SSL_ERROR_WANT_READ)
+        {
+          if (!gd_tls_flush (self, error))
+            return FALSE;
+          if (!gd_tls_feed (self, error))
+            return FALSE;
+        }
+      else if (err == SSL_ERROR_WANT_WRITE)
+        {
+          if (!gd_tls_flush (self, error))
+            return FALSE;
+        }
+      else
+        {
+          gd_tls_set_ossl_error (error, "TLS handshake failed");
+          return FALSE;
+        }
+    }
 
   self->tls_ready = TRUE;
   fp_dbg ("TLS handshake complete");
@@ -575,23 +576,14 @@ gd_tls_handshake (FpiDeviceGoodix5xx *self, GError **error)
 static void
 gd_tls_deinit (FpiDeviceGoodix5xx *self)
 {
-  if (self->tls_ready)
+  if (self->tls_ready && self->tls_ssl)
     {
-      gnutls_bye (self->tls_session, GNUTLS_SHUT_RDWR);
+      SSL_shutdown (self->tls_ssl);
       self->tls_ready = FALSE;
     }
-  if (self->tls_session)
-    {
-      gnutls_deinit (self->tls_session);
-      self->tls_session = NULL;
-    }
-  if (self->tls_creds)
-    {
-      gnutls_psk_free_server_credentials (self->tls_creds);
-      self->tls_creds = NULL;
-    }
-  g_clear_pointer (&self->pull_buf, g_free);
-  self->pull_len = self->pull_pos = 0;
+  g_clear_pointer (&self->tls_ssl, SSL_free);   /* also frees internal BIO */
+  g_clear_pointer (&self->tls_net_bio, BIO_free);
+  g_clear_pointer (&self->tls_ctx, SSL_CTX_free);
   if (self->push_buf)
     {
       g_byte_array_free (self->push_buf, TRUE);
@@ -834,18 +826,31 @@ gd_op_get_image (FpiDeviceGoodix5xx *self, guint8 *out, gsize out_len,
 
   while (got < out_len)
     {
-      int ret = gnutls_record_recv (self->tls_session, out + got, out_len - got);
-      if (ret == GNUTLS_E_AGAIN || ret == GNUTLS_E_INTERRUPTED)
-        continue;
-      if (ret < 0)
+      int ret = SSL_read (self->tls_ssl, out + got, out_len - got);
+      int err;
+
+      if (ret > 0)
         {
-          g_set_error (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
-                       "TLS image read failed: %s", gnutls_strerror (ret));
-          return FALSE;
+          got += ret;
+          continue;
         }
-      if (ret == 0)
-        break;
-      got += ret;
+
+      err = SSL_get_error (self->tls_ssl, ret);
+      if (err == SSL_ERROR_WANT_READ)
+        {
+          if (!gd_tls_feed (self, error))
+            return FALSE;
+          continue;
+        }
+      if (err == SSL_ERROR_WANT_WRITE)
+        {
+          gd_tls_pump (self);
+          if (!gd_tls_flush (self, error))
+            return FALSE;
+          continue;
+        }
+      gd_tls_set_ossl_error (error, "TLS image read failed");
+      return FALSE;
     }
 
   if (got < out_len)
