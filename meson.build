@@ -158,7 +158,7 @@ driver_helper_mapping = {
     'aes3500' : [ 'aeslib', 'aes3k' ],
     'aes4000' : [ 'aeslib', 'aes3k' ],
     'uru4000' : [ 'nss' ],
-    'goodix5xx' : [ 'gnutls' ],
+    'goodix5xx' : [ 'openssl' ],
     'elanspi' : [ 'udev' ],
     'virtual_image'          : [ 'virtual' ],
     'virtual_device'         : [ 'virtual' ],
@@ -222,13 +222,13 @@ foreach i : driver_helpers
         endif
 
         optional_deps += nss_dep
-    elif i == 'gnutls'
-        gnutls_dep = dependency('gnutls', required: false)
-        if not gnutls_dep.found()
-            error('gnutls is required for @0@ and possibly others'.format(driver))
+    elif i == 'openssl'
+        openssl_dep = dependency('openssl', required: false)
+        if not openssl_dep.found()
+            error('openssl is required for @0@ and possibly others'.format(driver))
         endif
 
-        optional_deps += gnutls_dep
+        optional_deps += openssl_dep
     elif i == 'udev'
         install_udev_rules = true
 
