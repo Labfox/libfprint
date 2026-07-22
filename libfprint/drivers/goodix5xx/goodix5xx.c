@@ -164,6 +164,7 @@ struct _FpiDeviceGoodix5xx
   GThread                  *worker;
   GdAction                  action;          /* what the worker is doing */
   gboolean                  stopping;        /* set to unblock/stop the worker (atomic) */
+  gboolean                  worker_done;     /* worker has finished and may be joined (atomic) */
   gboolean                  action_completed;/* current action already completed (main thread) */
   guint                     generation;      /* bumped per action; stale worker marshals are ignored */
 
@@ -1576,7 +1577,7 @@ gd_worker (gpointer data)
     }
 
   gd_marshal (self, gen, gd_idle_finish, NULL, 0, NULL);
-  return NULL;
+  goto done;
 
 err:
   /* Drop the (possibly broken) TLS session so the next action starts clean. */
@@ -1594,6 +1595,12 @@ err:
       error = wrapped;
     }
   gd_marshal (self, gen, gd_idle_error, NULL, 0, error);
+
+done:
+  /* Publish that the worker has finished, then wake the main context so a
+   * gd_reap_worker() pumping it observes worker_done and stops iterating. */
+  g_atomic_int_set (&self->worker_done, TRUE);
+  g_main_context_wakeup (NULL);
   return NULL;
 }
 
@@ -1680,8 +1687,17 @@ gd_discover_endpoints (FpiDeviceGoodix5xx *self, GError **error)
   return TRUE;
 }
 
-/* Signal any running worker to stop and reap it.  Safe to call when the worker
- * has already exited (join returns immediately). */
+/* Signal any running worker to stop and reap it.
+ *
+ * The worker may be blocked in a synchronous g_usb_device_bulk_transfer() whose
+ * completion is dispatched from *this* (main) GMainContext, so a plain
+ * g_thread_join() here would deadlock -- the transfer could never complete
+ * because the loop that would complete it is blocked in the join.  Instead,
+ * iterate the main context until the worker signals it is done (letting its
+ * in-flight transfer complete or time out and the worker observe `stopping`),
+ * then join, which is now immediate.  In the common case the worker has already
+ * finished (it reports only after the finger lifts, past all USB), so the loop
+ * body never runs. */
 static void
 gd_reap_worker (FpiDeviceGoodix5xx *self)
 {
@@ -1689,6 +1705,8 @@ gd_reap_worker (FpiDeviceGoodix5xx *self)
     return;
   g_atomic_int_set (&self->stopping, TRUE);
   gd_resume (self, GD_RESUME_STOP);
+  while (!g_atomic_int_get (&self->worker_done))
+    g_main_context_iteration (NULL, TRUE);
   g_thread_join (self->worker);
   self->worker = NULL;
 }
@@ -1725,6 +1743,10 @@ dev_close (FpDevice *dev)
   FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
   GError *error = NULL;
 
+  /* Supersede the worker's generation before reaping so that any completion it
+   * marshals while gd_reap_worker() pumps the context is ignored rather than
+   * completing an action on a device that is closing. */
+  self->generation++;
   gd_reap_worker (self);
 
   gd_tls_deinit (self);
@@ -1745,15 +1767,18 @@ gd_start_action (FpDevice *dev, GdAction action)
 {
   FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
 
+  /* New action generation, bumped *before* reaping so that any idle marshals
+   * the old worker emits while gd_reap_worker() pumps the main context belong
+   * to a superseded generation and are ignored (they must not touch this new
+   * action). */
+  self->generation++;
   gd_reap_worker (self);
 
-  /* New action generation: any still-queued idle marshals from the worker we
-   * just reaped now belong to a superseded generation and are ignored. */
-  self->generation++;
   self->action_completed = FALSE;
   self->action = action;
   self->step_resume = GD_RESUME_NONE;
   g_atomic_int_set (&self->stopping, FALSE);
+  g_atomic_int_set (&self->worker_done, FALSE);
 
   if (action == GD_ACT_ENROLL)
     {
