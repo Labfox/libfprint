@@ -9,7 +9,7 @@ pkgdesc='Library for fingerprint readers (with Goodix 27c6:55a4 goodix5xx driver
 arch=('x86_64')
 url='https://gitlab.freedesktop.org/libfprint/libfprint'
 license=('LGPL-2.1-or-later')
-depends=('glib2' 'libgusb' 'libgudev' 'nss' 'pixman' 'openssl')
+depends=('glib2' 'libgusb' 'libgudev' 'nss' 'pixman' 'openssl' 'opencv')
 makedepends=('meson' 'git' 'gobject-introspection' 'gtk3')
 provides=("libfprint=$pkgver" 'libfprint-2.so')
 conflicts=('libfprint')

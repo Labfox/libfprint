@@ -26,10 +26,10 @@
 
 #pragma once
 
-#include "fpi-image-device.h"
+#include "fpi-device.h"
 
 G_DECLARE_FINAL_TYPE (FpiDeviceGoodix5xx, fpi_device_goodix5xx, FPI,
-                      DEVICE_GOODIX5XX, FpImageDevice)
+                      DEVICE_GOODIX5XX, FpDevice)
 
 /* ------------------------------------------------------------------ *
  *  Message framing (goodix.py)

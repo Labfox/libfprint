@@ -211,7 +211,7 @@ driver_helper_mapping = {
     'aes3500' : [ 'aeslib', 'aes3k' ],
     'aes4000' : [ 'aeslib', 'aes3k' ],
     'uru4000' : [ 'openssl' ],
-    'goodix5xx' : [ 'openssl' ],
+    'goodix5xx' : [ 'openssl', 'opencv' ],
     'elanspi' : [ 'udev' ],
     'virtual_image'          : [ 'virtual' ],
     'virtual_device'         : [ 'virtual' ],
@@ -275,6 +275,17 @@ foreach i : driver_helpers
         endif
 
         optional_deps += openssl_dep
+    elif i == 'opencv'
+        # SIGFM (SIFT-based) matcher for the small Goodix image sensors.
+        opencv_dep = dependency('opencv5', required: false)
+        if not opencv_dep.found()
+            opencv_dep = dependency('opencv4', required: false)
+        endif
+        if not opencv_dep.found()
+            error('opencv (opencv5 or opencv4) is required for @0@ and possibly others'.format(driver))
+        endif
+
+        optional_deps += opencv_dep
     elif i == 'udev'
         install_udev_rules = true
 
