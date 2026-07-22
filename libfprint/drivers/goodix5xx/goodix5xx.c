@@ -28,8 +28,9 @@
 #include <openssl/err.h>
 
 #include "drivers_api.h"
-#include "fpi-image.h"
+#include "fpi-print.h"
 #include "goodix5xx.h"
+#include "goodix5xx-match.h"
 
 /* ------------------------------------------------------------------ *
  *  Device constants (driver_55x4.py)
@@ -49,6 +50,9 @@
 #define GD_IMAGE_WIDTH          GD_SENSOR_HEIGHT
 #define GD_IMAGE_HEIGHT         GD_SENSOR_WIDTH
 
+/* Pixels in the decoded 8-bit frame. */
+#define GD_IMAGE_PIXELS         (GD_IMAGE_WIDTH * GD_IMAGE_HEIGHT)
+
 /* SENSOR_WIDTH * SENSOR_HEIGHT / 4 * 6 + 4 (see tool.decode_image) */
 #define GD_IMAGE_BYTES          ((GD_SENSOR_WIDTH * GD_SENSOR_HEIGHT / 4 * 6) + 4)
 
@@ -56,6 +60,15 @@
 #define GD_USB_PACKET_SIZE      0x40    /* bulk wMaxPacketSize; writes are chunked to this */
 #define GD_FINGER_POLL_TIMEOUT  2000    /* ms */
 #define GD_READ_BUF_SIZE        0x10000
+
+/* SIGFM matching parameters (goodix-fp-linux-dev goodix53x5 reference).  The
+ * 88x108 sensor yields far too few NBIS minutiae for bozorth3, so matching is
+ * done with the SIFT-based SIGFM matcher instead.  Enrollment collects several
+ * samples covering different sub-regions of the finger; a probe is accepted if
+ * its best score against any single enrolled sample clears the threshold. */
+#define GD_ENROLL_SAMPLES          8
+#define GD_SIGFM_BEST_MIN          150   /* accept if best single-sample score >= this */
+#define GD_MIN_CAPTURE_KEYPOINTS   20    /* reject captures with fewer SIFT keypoints */
 
 /* PSK / whitebox key material (driver_55x4.py) */
 static const guint8 GD_PSK[32] = { 0 };
@@ -116,17 +129,54 @@ static const guint8 GD_FDT_DOWN[] = {
   0x80, 0xa6,
 };
 
+/* Finger-up detector.  The 55x4 python reference never lifts (it captures a
+ * single frame), so there is no reference payload; following the observed
+ * Goodix convention (fdt down=0x0c, mode=0x0d, up=0x0e -- see driver_51x7 /
+ * driver_5503) this reuses the fdt-down thresholds with the up opcode byte. */
+static const guint8 GD_FDT_UP[] = {
+  0x0e, 0x01, 0x80, 0xb0, 0x80, 0xc4, 0x80, 0xba, 0x80, 0xa6, 0x80, 0xb7,
+  0x80, 0xc7, 0x80, 0xc0, 0x80, 0xaa, 0x80, 0xb4, 0x80, 0xc4, 0x80, 0xba,
+  0x80, 0xa6,
+};
+
 /* ------------------------------------------------------------------ */
+
+/* Worker action mode. */
+typedef enum
+{
+  GD_ACT_ENROLL,
+  GD_ACT_VERIFY,
+  GD_ACT_IDENTIFY,
+} GdAction;
+
+/* Handshake between worker and main thread after each captured enroll frame. */
+typedef enum
+{
+  GD_RESUME_NONE = 0,   /* main thread has not decided yet */
+  GD_RESUME_CONTINUE,   /* capture another frame */
+  GD_RESUME_STOP,       /* stop the worker (action finished / cancelled) */
+} GdResume;
 
 struct _FpiDeviceGoodix5xx
 {
-  FpImageDevice             parent;
+  FpDevice                  parent;
 
   GThread                  *worker;
-  gboolean                  deactivating;
+  GdAction                  action;          /* what the worker is doing */
+  gboolean                  stopping;        /* set to unblock/stop the worker (atomic) */
+
+  /* Enroll: main thread owns these (touched only from idle callbacks). */
+  GPtrArray                *enroll_features;  /* GBytes templates */
+  gint                      enroll_stage;    /* good samples collected so far */
+
+  /* Per-frame worker<->main gate (enroll loop). */
+  GMutex                    step_mutex;
+  GCond                     step_cond;
+  gint                      step_resume;     /* GdResume */
 
   GUsbDevice               *usb;
   guint8                   *read_buf;      /* GD_READ_BUF_SIZE */
+  guint8                   *bg;            /* calibration frame (npix), or NULL */
 
   guint8                    iface;         /* claimed interface number */
   guint8                    ep_in;         /* bulk IN endpoint address */
@@ -147,7 +197,7 @@ struct _FpiDeviceGoodix5xx
   GByteArray               *push_buf;
 };
 
-G_DEFINE_TYPE (FpiDeviceGoodix5xx, fpi_device_goodix5xx, FP_TYPE_IMAGE_DEVICE)
+G_DEFINE_TYPE (FpiDeviceGoodix5xx, fpi_device_goodix5xx, FP_TYPE_DEVICE)
 
 /* ================================================================== *
  *  Raw USB message framing
@@ -804,6 +854,25 @@ gd_op_fdt_down (FpiDeviceGoodix5xx *self, guint timeout, GError **error)
   return payload != NULL;
 }
 
+/* Arm the finger-up detector and wait for the finger to be lifted.  Same shape
+ * as gd_op_fdt_down; the reply arrives once the finger leaves the sensor. */
+static gboolean
+gd_op_fdt_up (FpiDeviceGoodix5xx *self, guint timeout, GError **error)
+{
+  const guint8 *payload;
+  guint8 flags;
+  gsize plen;
+
+  if (!gd_send_cmd (self, GD_CMD_MCU_SWITCH_TO_FDT_UP, GD_FDT_UP,
+                    sizeof (GD_FDT_UP), error))
+    return FALSE;
+  if (!gd_read_ack (self, GD_CMD_MCU_SWITCH_TO_FDT_UP, error))
+    return FALSE;
+
+  payload = gd_read_pack (self, timeout, &flags, &plen, error);
+  return payload != NULL;
+}
+
 static gboolean
 gd_op_idle_mode (FpiDeviceGoodix5xx *self, guint8 sleep_time, GError **error)
 {
@@ -884,12 +953,12 @@ gd_op_get_image (FpiDeviceGoodix5xx *self, guint8 *out, gsize out_len,
 }
 
 /* tool.decode_image: 6 packed bytes -> 4 twelve-bit pixels. */
-static FpImage *
-gd_decode_image (const guint8 *data, gsize len)
+/* tool.decode_image: 6 packed bytes -> 4 twelve-bit pixels, scaled to 8-bit.
+ * Raw, with no post-processing (used both for finger frames and for the
+ * calibration "clear" frame). */
+static void
+gd_decode_raw8 (const guint8 *data, gsize len, guint8 *out, guint npix)
 {
-  FpImage *img = fp_image_new (GD_IMAGE_WIDTH, GD_IMAGE_HEIGHT);
-  guint npix = GD_IMAGE_WIDTH * GD_IMAGE_HEIGHT;
-  guint8 *out = img->data;
   guint p = 0;
   gsize i;
 
@@ -901,97 +970,366 @@ gd_decode_image (const guint8 *data, gsize len)
       guint16 v2 = ((c[5] & 0x0f) << 8) | c[2];
       guint16 v3 = (c[4] << 4) | (c[5] >> 4);
 
-      /* 12-bit -> 8-bit */
       out[p++] = v0 >> 4;
       out[p++] = v1 >> 4;
       out[p++] = v2 >> 4;
       out[p++] = v3 >> 4;
     }
+}
 
-  return img;
+/* Turn a raw finger frame into a clean grayscale image for mindtct.
+ *
+ * The sensor frame carries two artefacts that starve minutiae detection (only
+ * a handful of minutiae, so matching always scores 0):
+ *   1. a fixed per-pixel background pattern -- including a strong horizontal
+ *      row banding at the ridge frequency -- removed by subtracting the
+ *      calibration "clear" frame captured (finger-off) during init;
+ *   2. a residual slow low-frequency gradient, removed by subtracting a local
+ *      mean over a window wider than the ridge period (~11 px).
+ * The result is then stretched to the full 0..255 range.  Uses an integral
+ * image so the box mean is O(1) per pixel. */
+static void
+gd_process_image (guint8 *px, const guint8 *bg, guint w, guint h)
+{
+  const gint radius = 8;                 /* window ~17 px > ridge period */
+  guint n = w * h;
+  guint iw = w + 1;
+  gdouble *integ = g_malloc0 (sizeof (gdouble) * iw * (h + 1));
+  gint *work = g_malloc (sizeof (gint) * n);
+  gint *hp = g_malloc (sizeof (gint) * n);
+  gint x, y;
+  gint mn = G_MAXINT, mx = G_MININT;
+
+  /* 1. calibration subtraction (removes fixed pattern incl. row banding). */
+  for (x = 0; x < (gint) n; x++)
+    work[x] = (gint) px[x] - (bg ? (gint) bg[x] : 0);
+
+  /* Integral image of the calibration-subtracted frame. */
+  for (y = 0; y < (gint) h; y++)
+    for (x = 0; x < (gint) w; x++)
+      integ[(y + 1) * iw + (x + 1)] =
+        work[y * w + x] + integ[y * iw + (x + 1)] +
+        integ[(y + 1) * iw + x] - integ[y * iw + x];
+
+  /* 2. subtract the local mean (high-pass) to flatten the residual gradient. */
+  for (y = 0; y < (gint) h; y++)
+    for (x = 0; x < (gint) w; x++)
+      {
+        gint x0 = MAX (0, x - radius), x1 = MIN ((gint) w - 1, x + radius);
+        gint y0 = MAX (0, y - radius), y1 = MIN ((gint) h - 1, y + radius);
+        gdouble sum = integ[(y1 + 1) * iw + (x1 + 1)] - integ[y0 * iw + (x1 + 1)]
+                      - integ[(y1 + 1) * iw + x0] + integ[y0 * iw + x0];
+        gint area = (x1 - x0 + 1) * (y1 - y0 + 1);
+        gint v = work[y * w + x] - (gint) (sum / area);
+        hp[y * w + x] = v;
+        mn = MIN (mn, v);
+        mx = MAX (mx, v);
+      }
+
+  /* 3. stretch to full range. */
+  if (mx > mn)
+    for (x = 0; x < (gint) n; x++)
+      px[x] = (guint8) (((hp[x] - mn) * 255) / (mx - mn));
+
+  g_free (integ);
+  g_free (work);
+  g_free (hp);
+}
+
+/* Decode + process one raw frame into a freshly allocated GD_IMAGE_PIXELS
+ * 8-bit buffer (the input to SIGFM/SIFT). */
+static guint8 *
+gd_decode_processed (FpiDeviceGoodix5xx *self, const guint8 *data, gsize len)
+{
+  guint8 *px = g_malloc0 (GD_IMAGE_PIXELS);
+
+  gd_decode_raw8 (data, len, px, GD_IMAGE_PIXELS);
+  gd_process_image (px, self->bg, GD_IMAGE_WIDTH, GD_IMAGE_HEIGHT);
+  return px;
 }
 
 /* ================================================================== *
  *  Worker thread: full activation + capture
  * ================================================================== */
 
+/* One marshalled call from the worker thread to the main loop. */
 typedef struct
 {
   FpiDeviceGoodix5xx *self;
-  FpImage            *image;
-  GError             *error;
-  gboolean            finger_present;
-} GdMainCall;
+  GoodixMatchInfo    *probe;      /* extracted SIGFM features (owned), or NULL */
+  int                 keypoints;
+  GError             *error;      /* owned, for the error/finish paths */
+} GdCall;
 
-static gboolean
-gd_idle_finger_on (gpointer data)
-{
-  GdMainCall *c = data;
-  fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (c->self), TRUE);
-  g_object_unref (c->self);
-  g_free (c);
-  return G_SOURCE_REMOVE;
-}
+/* Track whether the current action was already completed on the main thread,
+ * so the worker's terminal "finish" marshal doesn't double-complete it. */
+static gboolean gd_action_completed;
 
-static gboolean
-gd_idle_finger_off (gpointer data)
+/* Release the worker from its per-frame wait with the given decision. */
+static void
+gd_resume (FpiDeviceGoodix5xx *self, GdResume r)
 {
-  GdMainCall *c = data;
-  fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (c->self), FALSE);
-  g_object_unref (c->self);
-  g_free (c);
-  return G_SOURCE_REMOVE;
-}
-
-static gboolean
-gd_idle_image (gpointer data)
-{
-  GdMainCall *c = data;
-  fpi_image_device_image_captured (FP_IMAGE_DEVICE (c->self), c->image);
-  g_object_unref (c->self);
-  g_free (c);
-  return G_SOURCE_REMOVE;
-}
-
-static gboolean
-gd_idle_activate_done (gpointer data)
-{
-  GdMainCall *c = data;
-  fpi_image_device_activate_complete (FP_IMAGE_DEVICE (c->self), NULL);
-  g_object_unref (c->self);
-  g_free (c);
-  return G_SOURCE_REMOVE;
-}
-
-static gboolean
-gd_idle_deactivate_done (gpointer data)
-{
-  GdMainCall *c = data;
-  fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (c->self), NULL);
-  g_object_unref (c->self);
-  g_free (c);
-  return G_SOURCE_REMOVE;
-}
-
-static gboolean
-gd_idle_session_error (gpointer data)
-{
-  GdMainCall *c = data;
-  fpi_image_device_session_error (FP_IMAGE_DEVICE (c->self), c->error);
-  g_object_unref (c->self);
-  g_free (c);
-  return G_SOURCE_REMOVE;
+  g_mutex_lock (&self->step_mutex);
+  self->step_resume = r;
+  g_cond_signal (&self->step_cond);
+  g_mutex_unlock (&self->step_mutex);
 }
 
 static void
-gd_marshal (FpiDeviceGoodix5xx *self, GSourceFunc fn, FpImage *img, GError *err)
+gd_marshal (FpiDeviceGoodix5xx *self, GSourceFunc fn, GoodixMatchInfo *probe,
+            int keypoints, GError *err)
 {
-  GdMainCall *c = g_new0 (GdMainCall, 1);
+  GdCall *c = g_new0 (GdCall, 1);
 
   c->self = g_object_ref (self);
-  c->image = img;
+  c->probe = probe;
+  c->keypoints = keypoints;
   c->error = err;
   g_idle_add (fn, c);
+}
+
+/* Complete whatever action is in progress with @error (transfers ownership). */
+static void
+gd_complete_action (FpDevice *dev, GError *error)
+{
+  FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
+
+  if (gd_action_completed)
+    {
+      g_clear_error (&error);
+      return;
+    }
+  gd_action_completed = TRUE;
+
+  switch (self->action)
+    {
+    case GD_ACT_ENROLL:
+      g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
+      fpi_device_enroll_complete (dev, NULL, error);
+      break;
+    case GD_ACT_VERIFY:
+      fpi_device_verify_complete (dev, error);
+      break;
+    case GD_ACT_IDENTIFY:
+      fpi_device_identify_complete (dev, error);
+      break;
+    }
+}
+
+/* Best SIGFM score of @probe against all serialized samples of @print. */
+static int
+gd_best_score (GoodixMatchInfo *probe, FpPrint *print)
+{
+  g_autoptr(GVariant) data = NULL;
+  GVariantIter iter;
+  GVariant *child;
+  int best = 0;
+
+  g_object_get (G_OBJECT (print), "fpi-data", &data, NULL);
+  if (data == NULL || !g_variant_is_of_type (data, G_VARIANT_TYPE ("aay")))
+    return 0;
+
+  g_variant_iter_init (&iter, data);
+  while ((child = g_variant_iter_next_value (&iter)))
+    {
+      gsize len;
+      const guint8 *feature = g_variant_get_fixed_array (child, &len, 1);
+
+      if (len > 0)
+        {
+          int score = 0;
+
+          if (goodix_match_serialized_feature (probe, feature, len, &score)
+              == GOODIX_SIGFM_TEMPLATE_OK && score > best)
+            best = score;
+        }
+      g_variant_unref (child);
+    }
+  return best;
+}
+
+/* Main-thread: an error/finish from the worker. */
+static gboolean
+gd_idle_error (gpointer data)
+{
+  GdCall *c = data;
+
+  gd_complete_action (FP_DEVICE (c->self), g_steal_pointer (&c->error));
+  g_object_unref (c->self);
+  g_free (c);
+  return G_SOURCE_REMOVE;
+}
+
+/* Main-thread: the worker's loop ended.  If nothing completed the action yet
+ * (i.e. it was cancelled), complete it now with a cancelled error. */
+static gboolean
+gd_idle_finish (gpointer data)
+{
+  GdCall *c = data;
+
+  if (!gd_action_completed)
+    gd_complete_action (FP_DEVICE (c->self),
+                        g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                                             "Operation cancelled"));
+  g_object_unref (c->self);
+  g_free (c);
+  return G_SOURCE_REMOVE;
+}
+
+/* Main-thread: build and store the enrolled print from the collected samples. */
+static void
+gd_finish_enroll (FpDevice *dev)
+{
+  FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
+  GVariantBuilder builder;
+  FpPrint *print = NULL;
+  GVariant *fpdata;
+  guint i;
+
+  fpi_device_get_enroll_data (dev, &print);
+  fpi_print_set_type (print, FPI_PRINT_RAW);
+
+  g_variant_builder_init (&builder, G_VARIANT_TYPE ("aay"));
+  for (i = 0; i < self->enroll_features->len; i++)
+    {
+      GBytes *feature = g_ptr_array_index (self->enroll_features, i);
+      gsize len;
+      const guint8 *bytes = g_bytes_get_data (feature, &len);
+
+      g_variant_builder_add (&builder, "@ay",
+                             g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
+                                                        bytes, len, 1));
+    }
+  fpdata = g_variant_builder_end (&builder);
+  g_object_set (G_OBJECT (print), "fpi-data", fpdata, NULL);
+
+  g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
+
+  gd_action_completed = TRUE;
+  fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+}
+
+/* Main-thread: process one captured frame according to the current action.
+ * Consumes c->probe.  Ends by resuming the worker (CONTINUE or STOP). */
+static gboolean
+gd_idle_frame (gpointer data)
+{
+  GdCall *c = data;
+  FpiDeviceGoodix5xx *self = c->self;
+  FpDevice *dev = FP_DEVICE (self);
+  GoodixMatchInfo *probe = c->probe;
+
+  /* Too few keypoints: ask for a re-scan (do not count this frame). */
+  if (c->keypoints < GD_MIN_CAPTURE_KEYPOINTS)
+    {
+      fp_dbg ("capture rejected: %d keypoints (< %d)",
+              c->keypoints, GD_MIN_CAPTURE_KEYPOINTS);
+      if (self->action == GD_ACT_ENROLL)
+        {
+          fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
+                                      fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
+          gd_resume (self, GD_RESUME_CONTINUE);
+        }
+      else if (self->action == GD_ACT_VERIFY)
+        {
+          fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL,
+                                    fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
+          gd_complete_action (dev, NULL);
+          gd_resume (self, GD_RESUME_STOP);
+        }
+      else
+        {
+          fpi_device_identify_report (dev, NULL, NULL,
+                                      fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
+          gd_complete_action (dev, NULL);
+          gd_resume (self, GD_RESUME_STOP);
+        }
+      goto out;
+    }
+
+  switch (self->action)
+    {
+    case GD_ACT_ENROLL:
+      {
+        GBytes *feature = goodix_match_serialize_template (probe);
+
+        if (feature == NULL)
+          {
+            gd_complete_action (dev,
+                                fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                                          "Failed to serialize SIGFM features"));
+            gd_resume (self, GD_RESUME_STOP);
+            break;
+          }
+
+        g_ptr_array_add (self->enroll_features, feature);
+        self->enroll_stage++;
+        fp_dbg ("enroll stage %d/%d", self->enroll_stage, GD_ENROLL_SAMPLES);
+        fpi_device_enroll_progress (dev, self->enroll_stage, NULL, NULL);
+
+        if (self->enroll_stage >= GD_ENROLL_SAMPLES)
+          {
+            gd_finish_enroll (dev);
+            gd_resume (self, GD_RESUME_STOP);
+          }
+        else
+          {
+            gd_resume (self, GD_RESUME_CONTINUE);
+          }
+      }
+      break;
+
+    case GD_ACT_VERIFY:
+      {
+        FpPrint *enrolled = NULL;
+        int best;
+
+        fpi_device_get_verify_data (dev, &enrolled);
+        best = gd_best_score (probe, enrolled);
+        fp_dbg ("verify best SIGFM score %d (min %d)", best, GD_SIGFM_BEST_MIN);
+
+        fpi_device_verify_report (dev,
+                                  best >= GD_SIGFM_BEST_MIN ? FPI_MATCH_SUCCESS
+                                                            : FPI_MATCH_FAIL,
+                                  NULL, NULL);
+        gd_complete_action (dev, NULL);
+        gd_resume (self, GD_RESUME_STOP);
+      }
+      break;
+
+    case GD_ACT_IDENTIFY:
+      {
+        GPtrArray *gallery = NULL;
+        FpPrint *match = NULL;
+        int best_match = 0;
+        guint i;
+
+        fpi_device_get_identify_data (dev, &gallery);
+        for (i = 0; gallery && i < gallery->len; i++)
+          {
+            FpPrint *tmpl = g_ptr_array_index (gallery, i);
+            int s = gd_best_score (probe, tmpl);
+
+            if (s >= GD_SIGFM_BEST_MIN && s > best_match)
+              {
+                best_match = s;
+                match = tmpl;
+              }
+          }
+        fp_dbg ("identify best SIGFM score %d (min %d)", best_match, GD_SIGFM_BEST_MIN);
+
+        fpi_device_identify_report (dev, match, NULL, NULL);
+        gd_complete_action (dev, NULL);
+        gd_resume (self, GD_RESUME_STOP);
+      }
+      break;
+    }
+
+out:
+  goodix_match_free_info (probe);
+  g_object_unref (c->self);
+  g_free (c);
+  return G_SOURCE_REMOVE;
 }
 
 static gboolean
@@ -1078,6 +1416,14 @@ gd_full_init (FpiDeviceGoodix5xx *self, GError **error)
     if (!gd_op_get_image (self, clear, GD_IMAGE_BYTES, error))     /* clear-1 */
       return FALSE;
 
+    /* Keep clear-1 (finger-off) as the calibration frame; gd_process_image
+     * subtracts it from every finger frame to cancel the sensor's fixed
+     * background pattern (see gd_process_image). */
+    if (!self->bg)
+      self->bg = g_malloc0 (GD_IMAGE_WIDTH * GD_IMAGE_HEIGHT);
+    gd_decode_raw8 (clear, GD_IMAGE_BYTES - 4, self->bg,
+                    GD_IMAGE_WIDTH * GD_IMAGE_HEIGHT);
+
     fp_dbg ("init: fdt mode + sleep");
     if (!gd_op_fdt_mode (self, error))
       return FALSE;
@@ -1089,46 +1435,76 @@ gd_full_init (FpiDeviceGoodix5xx *self, GError **error)
   return TRUE;
 }
 
+/* Poll the finger-down (or finger-up) detector until it fires or the worker is
+ * asked to stop.  Returns TRUE on the finger event, FALSE if stopping (*error
+ * NULL) or on a hard error (*error set). */
+static gboolean
+gd_wait_finger (FpiDeviceGoodix5xx *self, gboolean down, GError **error)
+{
+  while (!g_atomic_int_get (&self->stopping))
+    {
+      GError *err = NULL;
+      gboolean got = down ? gd_op_fdt_down (self, GD_FINGER_POLL_TIMEOUT, &err)
+                          : gd_op_fdt_up (self, GD_FINGER_POLL_TIMEOUT, &err);
+
+      if (got)
+        return TRUE;
+      if (err &&
+          !g_error_matches (err, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
+        {
+          g_propagate_error (error, err);
+          return FALSE;
+        }
+      g_clear_error (&err);
+    }
+  return FALSE;
+}
+
+/* Block until the main thread has processed the last frame, returning its
+ * decision (CONTINUE / STOP).  STOP also on stop request. */
+static GdResume
+gd_wait_resume (FpiDeviceGoodix5xx *self)
+{
+  GdResume r;
+
+  g_mutex_lock (&self->step_mutex);
+  while (self->step_resume == GD_RESUME_NONE &&
+         !g_atomic_int_get (&self->stopping))
+    g_cond_wait (&self->step_cond, &self->step_mutex);
+  r = self->step_resume;
+  g_mutex_unlock (&self->step_mutex);
+
+  if (g_atomic_int_get (&self->stopping))
+    return GD_RESUME_STOP;
+  return r;
+}
+
 static gpointer
 gd_worker (gpointer data)
 {
   FpiDeviceGoodix5xx *self = data;
   GError *error = NULL;
-  guint8 *raw = NULL;
-  FpImage *img = NULL;
 
   if (!gd_full_init (self, &error))
     goto err;
 
-  gd_marshal (self, gd_idle_activate_done, NULL, NULL);
-
-  /* Capture loop: one image per finger press. */
-  while (!g_atomic_int_get (&self->deactivating))
+  /* Capture loop.  Enroll collects GD_ENROLL_SAMPLES good frames; verify and
+   * identify capture a single frame.  The main thread decides after each frame
+   * whether to continue (via the step gate), so the worker never starts a new
+   * capture after the action has completed. */
+  while (!g_atomic_int_get (&self->stopping))
     {
-      /* Wait for a finger, polling so we can honour deactivation. */
-      gboolean finger = FALSE;
-      while (!g_atomic_int_get (&self->deactivating))
+      guint8 *raw;
+      guint8 *px;
+      GoodixMatchInfo *probe;
+      int keypoints;
+
+      if (!gd_wait_finger (self, TRUE, &error))
         {
-          GError *poll_err = NULL;
-          if (gd_op_fdt_down (self, GD_FINGER_POLL_TIMEOUT, &poll_err))
-            {
-              finger = TRUE;
-              break;
-            }
-          if (poll_err &&
-              !g_error_matches (poll_err, G_USB_DEVICE_ERROR,
-                                G_USB_DEVICE_ERROR_TIMED_OUT))
-            {
-              error = poll_err;
-              goto err;
-            }
-          g_clear_error (&poll_err);
+          if (error)
+            goto err;
+          break;                    /* stop requested */
         }
-
-      if (!finger)
-        break;
-
-      gd_marshal (self, gd_idle_finger_on, NULL, NULL);
 
       raw = g_malloc0 (GD_IMAGE_BYTES);
       if (!gd_op_get_image (self, raw, GD_IMAGE_BYTES, &error))
@@ -1136,28 +1512,42 @@ gd_worker (gpointer data)
           g_free (raw);
           goto err;
         }
-
       /* Drop the trailing 4 bytes (tool.decode_image uses data[:-4]). */
-      img = gd_decode_image (raw, GD_IMAGE_BYTES - 4);
+      px = gd_decode_processed (self, raw, GD_IMAGE_BYTES - 4);
       g_free (raw);
-      raw = NULL;
 
-      gd_marshal (self, gd_idle_image, img, NULL);
-      img = NULL;
+      probe = goodix_match_extract (px, GD_IMAGE_WIDTH, GD_IMAGE_HEIGHT);
+      keypoints = goodix_match_keypoints_count (probe);
+      g_free (px);
 
-      gd_marshal (self, gd_idle_finger_off, NULL, NULL);
+      /* Hand the frame to the main thread, then wait for the finger to lift and
+       * for the main thread's decision before looping. */
+      gd_resume (self, GD_RESUME_NONE);   /* arm the gate before marshalling */
+      gd_marshal (self, gd_idle_frame, probe, keypoints, NULL);
 
-      /* One capture per activation; the image device re-activates as needed. */
-      break;
+      /* Wait for the main thread's decision first, so a completed action stops
+       * the worker immediately without a lingering finger-up USB transfer that
+       * a join at close/next-action would deadlock on. */
+      if (gd_wait_resume (self) == GD_RESUME_STOP)
+        break;
+
+      /* CONTINUE (another enroll stage): wait for the finger to physically lift
+       * so the next stage is a fresh press, not the same contact. */
+      if (!gd_wait_finger (self, FALSE, &error))
+        {
+          if (error)
+            goto err;
+          break;
+        }
     }
 
-  gd_marshal (self, gd_idle_deactivate_done, NULL, NULL);
+  gd_marshal (self, gd_idle_finish, NULL, 0, NULL);
   return NULL;
 
 err:
-  /* libfprint discards (and replaces with a generic message) any error that
-   * is not in the FpDeviceError / FpDeviceRetry domain, which would hide the
-   * real cause.  Re-wrap while preserving the original message. */
+  /* libfprint discards (and replaces with a generic message) any error that is
+   * not in the FpDeviceError / FpDeviceRetry domain, which would hide the real
+   * cause.  Re-wrap while preserving the original message. */
   if (error &&
       error->domain != FP_DEVICE_ERROR && error->domain != FP_DEVICE_RETRY)
     {
@@ -1166,7 +1556,7 @@ err:
       g_error_free (error);
       error = wrapped;
     }
-  gd_marshal (self, gd_idle_session_error, NULL, error);
+  gd_marshal (self, gd_idle_error, NULL, 0, error);
   return NULL;
 }
 
@@ -1253,64 +1643,116 @@ gd_discover_endpoints (FpiDeviceGoodix5xx *self, GError **error)
   return TRUE;
 }
 
+/* Signal any running worker to stop and reap it.  Safe to call when the worker
+ * has already exited (join returns immediately). */
 static void
-dev_open (FpImageDevice *dev)
+gd_reap_worker (FpiDeviceGoodix5xx *self)
+{
+  if (!self->worker)
+    return;
+  g_atomic_int_set (&self->stopping, TRUE);
+  gd_resume (self, GD_RESUME_STOP);
+  g_thread_join (self->worker);
+  self->worker = NULL;
+}
+
+static void
+dev_open (FpDevice *dev)
 {
   FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
   GError *error = NULL;
 
-  self->usb = fpi_device_get_usb_device (FP_DEVICE (dev));
+  self->usb = fpi_device_get_usb_device (dev);
   self->read_buf = g_malloc0 (GD_READ_BUF_SIZE);
+  g_mutex_init (&self->step_mutex);
+  g_cond_init (&self->step_cond);
 
   if (!gd_discover_endpoints (self, &error))
     {
-      fpi_image_device_open_complete (dev, error);
+      fpi_device_open_complete (dev, error);
       return;
     }
 
   if (!g_usb_device_claim_interface (self->usb, self->iface, 0, &error))
     {
-      fpi_image_device_open_complete (dev, error);
+      fpi_device_open_complete (dev, error);
       return;
     }
 
-  fpi_image_device_open_complete (dev, NULL);
+  fpi_device_open_complete (dev, NULL);
 }
 
 static void
-dev_close (FpImageDevice *dev)
+dev_close (FpDevice *dev)
 {
   FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
   GError *error = NULL;
 
+  gd_reap_worker (self);
+
   gd_tls_deinit (self);
   g_clear_pointer (&self->read_buf, g_free);
+  g_clear_pointer (&self->bg, g_free);
+  g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
+  g_mutex_clear (&self->step_mutex);
+  g_cond_clear (&self->step_cond);
 
   g_usb_device_release_interface (self->usb, self->iface, 0, &error);
 
-  fpi_image_device_close_complete (dev, error);
+  fpi_device_close_complete (dev, error);
 }
 
+/* Start the worker for @action (enroll / verify / identify). */
 static void
-dev_activate (FpImageDevice *dev)
+gd_start_action (FpDevice *dev, GdAction action)
 {
   FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
 
-  g_atomic_int_set (&self->deactivating, FALSE);
+  gd_reap_worker (self);
+
+  gd_action_completed = FALSE;
+  self->action = action;
+  self->step_resume = GD_RESUME_NONE;
+  g_atomic_int_set (&self->stopping, FALSE);
+
+  if (action == GD_ACT_ENROLL)
+    {
+      self->enroll_stage = 0;
+      g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
+      self->enroll_features =
+        g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+    }
+
   self->worker = g_thread_new ("goodix5xx-worker", gd_worker, self);
 }
 
 static void
-dev_deactivate (FpImageDevice *dev)
+dev_enroll (FpDevice *dev)
+{
+  gd_start_action (dev, GD_ACT_ENROLL);
+}
+
+static void
+dev_verify (FpDevice *dev)
+{
+  gd_start_action (dev, GD_ACT_VERIFY);
+}
+
+static void
+dev_identify (FpDevice *dev)
+{
+  gd_start_action (dev, GD_ACT_IDENTIFY);
+}
+
+static void
+dev_cancel (FpDevice *dev)
 {
   FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
 
-  g_atomic_int_set (&self->deactivating, TRUE);
-  if (self->worker)
-    {
-      g_thread_join (self->worker);
-      self->worker = NULL;
-    }
+  /* Ask the worker to stop; it completes the action with a cancelled error
+   * from its finish marshal (see gd_idle_finish). */
+  g_atomic_int_set (&self->stopping, TRUE);
+  gd_resume (self, GD_RESUME_STOP);
 }
 
 static const FpIdEntry id_table[] = {
@@ -1327,20 +1769,20 @@ static void
 fpi_device_goodix5xx_class_init (FpiDeviceGoodix5xxClass *klass)
 {
   FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
-  FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (klass);
 
   dev_class->id = "goodix5xx";
   dev_class->full_name = "Goodix 55x4 Fingerprint Sensor";
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+  dev_class->nr_enroll_stages = GD_ENROLL_SAMPLES;
+  dev_class->temp_hot_seconds = -1;    /* small sensor: no thermal throttling */
+  dev_class->features = FP_DEVICE_FEATURE_VERIFY | FP_DEVICE_FEATURE_IDENTIFY;
 
-  img_class->img_open = dev_open;
-  img_class->img_close = dev_close;
-  img_class->activate = dev_activate;
-  img_class->deactivate = dev_deactivate;
-
-  img_class->img_width = GD_IMAGE_WIDTH;
-  img_class->img_height = GD_IMAGE_HEIGHT;
-  img_class->bz3_threshold = 24;
+  dev_class->open = dev_open;
+  dev_class->close = dev_close;
+  dev_class->enroll = dev_enroll;
+  dev_class->verify = dev_verify;
+  dev_class->identify = dev_identify;
+  dev_class->cancel = dev_cancel;
 }

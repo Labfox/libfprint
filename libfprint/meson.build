@@ -140,7 +140,9 @@ driver_sources = {
     'goodixmoc' :
         [ 'drivers/goodixmoc/goodix.c', 'drivers/goodixmoc/goodix_proto.c' ],
     'goodix5xx' :
-        [ 'drivers/goodix5xx/goodix5xx.c' ],
+        [ 'drivers/goodix5xx/goodix5xx.c',
+          'drivers/goodix5xx/goodix5xx-match.c',
+          'drivers/goodix5xx/sigfm/sigfm.cpp' ],
     'fpcmoc' :
         [ 'drivers/fpcmoc/fpc.c' ],
 }
@@ -155,6 +157,8 @@ helper_sources = {
     'nss' :
         [ ],
     'openssl' :
+        [ ],
+    'opencv' :
         [ ],
     'udev' :
         [ ],
