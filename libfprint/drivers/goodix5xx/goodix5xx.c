@@ -178,7 +178,7 @@ struct _FpiDeviceGoodix5xx
 
   GUsbDevice               *usb;
   guint8                   *read_buf;      /* GD_READ_BUF_SIZE */
-  guint8                   *bg;            /* calibration frame (npix), or NULL */
+  guint16                  *bg;            /* 12-bit no-finger calibration frame (npix), or NULL */
 
   guint8                    iface;         /* claimed interface number */
   guint8                    ep_in;         /* bulk IN endpoint address */
@@ -954,12 +954,15 @@ gd_op_get_image (FpiDeviceGoodix5xx *self, guint8 *out, gsize out_len,
   return TRUE;
 }
 
-/* tool.decode_image: 6 packed bytes -> 4 twelve-bit pixels. */
-/* tool.decode_image: 6 packed bytes -> 4 twelve-bit pixels, scaled to 8-bit.
- * Raw, with no post-processing (used both for finger frames and for the
- * calibration "clear" frame). */
+/* Raw ADC value that means "ADC full scale" -- the sensor saturates here where
+ * no finger is in contact (goodix53x5 GOODIX_RAW12_CLIP). */
+#define GD_RAW12_CLIP 4095
+
+/* tool.decode_image: 6 packed bytes -> 4 twelve-bit pixels.  Keeps the full
+ * 12-bit precision (the reference driver normalises in 12-bit space; downshifting
+ * to 8 bits here would throw away ridge contrast before normalisation). */
 static void
-gd_decode_raw8 (const guint8 *data, gsize len, guint8 *out, guint npix)
+gd_decode_raw12 (const guint8 *data, gsize len, guint16 *out, guint npix)
 {
   guint p = 0;
   gsize i;
@@ -967,75 +970,82 @@ gd_decode_raw8 (const guint8 *data, gsize len, guint8 *out, guint npix)
   for (i = 0; i + 6 <= len && p + 4 <= npix; i += 6)
     {
       const guint8 *c = data + i;
-      guint16 v0 = ((c[0] & 0x0f) << 8) | c[1];
-      guint16 v1 = (c[3] << 4) | (c[0] >> 4);
-      guint16 v2 = ((c[5] & 0x0f) << 8) | c[2];
-      guint16 v3 = (c[4] << 4) | (c[5] >> 4);
 
-      out[p++] = v0 >> 4;
-      out[p++] = v1 >> 4;
-      out[p++] = v2 >> 4;
-      out[p++] = v3 >> 4;
+      out[p++] = ((c[0] & 0x0f) << 8) | c[1];
+      out[p++] = (c[3] << 4) | (c[0] >> 4);
+      out[p++] = ((c[5] & 0x0f) << 8) | c[2];
+      out[p++] = (c[4] << 4) | (c[5] >> 4);
     }
 }
 
-/* Turn a raw finger frame into a clean grayscale image for mindtct.
- *
- * The sensor frame carries two artefacts that starve minutiae detection (only
- * a handful of minutiae, so matching always scores 0):
- *   1. a fixed per-pixel background pattern -- including a strong horizontal
- *      row banding at the ridge frequency -- removed by subtracting the
- *      calibration "clear" frame captured (finger-off) during init;
- *   2. a residual slow low-frequency gradient, removed by subtracting a local
- *      mean over a window wider than the ridge period (~11 px).
- * The result is then stretched to the full 0..255 range.  Uses an integral
- * image so the box mean is O(1) per pixel. */
-static void
-gd_process_image (guint8 *px, const guint8 *bg, guint w, guint h)
+static int
+gd_cmp_double (const void *a, const void *b)
 {
-  const gint radius = 8;                 /* window ~17 px > ridge period */
-  guint n = w * h;
-  guint iw = w + 1;
-  gdouble *integ = g_malloc0 (sizeof (gdouble) * iw * (h + 1));
-  gint *work = g_malloc (sizeof (gint) * n);
-  gint *hp = g_malloc (sizeof (gint) * n);
-  gint x, y;
-  gint mn = G_MAXINT, mx = G_MININT;
+  double l = *(const double *) a, r = *(const double *) b;
 
-  /* 1. calibration subtraction (removes fixed pattern incl. row banding). */
-  for (x = 0; x < (gint) n; x++)
-    work[x] = (gint) px[x] - (bg ? (gint) bg[x] : 0);
+  return (l > r) - (l < r);
+}
 
-  /* Integral image of the calibration-subtracted frame. */
-  for (y = 0; y < (gint) h; y++)
-    for (x = 0; x < (gint) w; x++)
-      integ[(y + 1) * iw + (x + 1)] =
-        work[y * w + x] + integ[y * iw + (x + 1)] +
-        integ[(y + 1) * iw + x] - integ[y * iw + x];
+/* Convert a 12-bit finger frame to an 8-bit image for SIGFM/SIFT, following the
+ * goodix53x5 reference (goodix_device_image_to_8bit).  This is deliberately
+ * *light*: subtract the no-finger calibration frame, then normalise the interior
+ * with a robust 3%..97% percentile stretch -- SIGFM's own CLAHE does the local
+ * contrast enhancement afterwards.  Applying an extra high-pass here (as an
+ * earlier version did) only turns sensor noise into non-repeatable SIFT
+ * keypoints that never match across presses.
+ *
+ * Crucially, pixels at ADC full scale (GD_RAW12_CLIP) are non-contact areas:
+ * the finger is not touching there, so they carry no ridge signal and their
+ * fixed pattern is destroyed by the clip.  They are excluded from the
+ * normalisation sample and painted flat white, so SIFT finds no keypoints in
+ * the empty regions -- only on the actual contact patch. */
+static void
+gd_image_to_8bit (const guint16 *img12, const guint16 *calib, guint8 *out)
+{
+  const int w = GD_IMAGE_WIDTH, h = GD_IMAGE_HEIGHT, n = GD_IMAGE_PIXELS;
+  double *corrected = g_malloc (n * sizeof (double));
+  double *sample = g_malloc ((w - 2) * (h - 2) * sizeof (double));
+  int sample_count = 0;
+  double lo, hi, white, range;
+  int i, r, c;
 
-  /* 2. subtract the local mean (high-pass) to flatten the residual gradient. */
-  for (y = 0; y < (gint) h; y++)
-    for (x = 0; x < (gint) w; x++)
-      {
-        gint x0 = MAX (0, x - radius), x1 = MIN ((gint) w - 1, x + radius);
-        gint y0 = MAX (0, y - radius), y1 = MIN ((gint) h - 1, y + radius);
-        gdouble sum = integ[(y1 + 1) * iw + (x1 + 1)] - integ[y0 * iw + (x1 + 1)]
-                      - integ[(y1 + 1) * iw + x0] + integ[y0 * iw + x0];
-        gint area = (x1 - x0 + 1) * (y1 - y0 + 1);
-        gint v = work[y * w + x] - (gint) (sum / area);
-        hp[y * w + x] = v;
-        mn = MIN (mn, v);
-        mx = MAX (mx, v);
-      }
+  for (i = 0; i < n; i++)
+    corrected[i] = calib ? (double) img12[i] - calib[i] : img12[i];
 
-  /* 3. stretch to full range. */
-  if (mx > mn)
-    for (x = 0; x < (gint) n; x++)
-      px[x] = (guint8) (((hp[x] - mn) * 255) / (mx - mn));
+  /* Sample only the interior, in-contact pixels for the percentile range. */
+  for (r = 1; r < h - 1; r++)
+    for (c = 1; c < w - 1; c++)
+      if (img12[r * w + c] < GD_RAW12_CLIP)
+        sample[sample_count++] = corrected[r * w + c];
 
-  g_free (integ);
-  g_free (work);
-  g_free (hp);
+  if (sample_count == 0)
+    {
+      /* No contact anywhere: flat white, no keypoints. */
+      memset (out, 255, n);
+      g_free (corrected);
+      g_free (sample);
+      return;
+    }
+
+  qsort (sample, sample_count, sizeof (double), gd_cmp_double);
+  lo    = sample[(int) (0.03 * (sample_count - 1))];
+  hi    = sample[(int) (0.97 * (sample_count - 1))];
+  white = sample[(int) (0.99 * (sample_count - 1))];
+
+  /* Non-contact pixels map above the ceiling -> flat white. */
+  for (i = 0; i < n; i++)
+    if (img12[i] >= GD_RAW12_CLIP)
+      corrected[i] = white;
+
+  range = hi - lo;
+  if (range < 1.0)
+    range = 1.0;
+
+  for (i = 0; i < n; i++)
+    out[i] = (guint8) CLAMP ((int) (((corrected[i] - lo) * 255.0) / range), 0, 255);
+
+  g_free (corrected);
+  g_free (sample);
 }
 
 /* Decode + process one raw frame into a freshly allocated GD_IMAGE_PIXELS
@@ -1043,10 +1053,11 @@ gd_process_image (guint8 *px, const guint8 *bg, guint w, guint h)
 static guint8 *
 gd_decode_processed (FpiDeviceGoodix5xx *self, const guint8 *data, gsize len)
 {
+  g_autofree guint16 *img12 = g_malloc0 (GD_IMAGE_PIXELS * sizeof (guint16));
   guint8 *px = g_malloc0 (GD_IMAGE_PIXELS);
 
-  gd_decode_raw8 (data, len, px, GD_IMAGE_PIXELS);
-  gd_process_image (px, self->bg, GD_IMAGE_WIDTH, GD_IMAGE_HEIGHT);
+  gd_decode_raw12 (data, len, img12, GD_IMAGE_PIXELS);
+  gd_image_to_8bit (img12, self->bg, px);
   return px;
 }
 
@@ -1430,13 +1441,12 @@ gd_full_init (FpiDeviceGoodix5xx *self, GError **error)
     if (!gd_op_get_image (self, clear, GD_IMAGE_BYTES, error))     /* clear-1 */
       return FALSE;
 
-    /* Keep clear-1 (finger-off) as the calibration frame; gd_process_image
-     * subtracts it from every finger frame to cancel the sensor's fixed
-     * background pattern (see gd_process_image). */
+    /* Keep clear-1 (finger-off) as the 12-bit calibration frame; it is
+     * subtracted from every finger frame in gd_image_to_8bit() to cancel the
+     * sensor's fixed background pattern. */
     if (!self->bg)
-      self->bg = g_malloc0 (GD_IMAGE_WIDTH * GD_IMAGE_HEIGHT);
-    gd_decode_raw8 (clear, GD_IMAGE_BYTES - 4, self->bg,
-                    GD_IMAGE_WIDTH * GD_IMAGE_HEIGHT);
+      self->bg = g_malloc0 (GD_IMAGE_PIXELS * sizeof (guint16));
+    gd_decode_raw12 (clear, GD_IMAGE_BYTES - 4, self->bg, GD_IMAGE_PIXELS);
 
     fp_dbg ("init: fdt mode + sleep");
     if (!gd_op_fdt_mode (self, error))
@@ -1500,6 +1510,10 @@ gd_worker (gpointer data)
   GError *error = NULL;
   guint gen = self->generation;   /* fixed for this worker's lifetime */
 
+  /* The sensor needs the full init sequence (reset, TLS, config, and the
+   * fdt-mode/clear-frame/sleep calibration dance) before each capture batch to
+   * produce consistently exposed images; skipping it makes captures from
+   * different sessions incomparable.  So re-init every action. */
   if (!gd_full_init (self, &error))
     goto err;
 
@@ -1535,31 +1549,39 @@ gd_worker (gpointer data)
       keypoints = goodix_match_keypoints_count (probe);
       g_free (px);
 
-      /* Hand the frame to the main thread, then wait for the finger to lift and
-       * for the main thread's decision before looping. */
+      /* Wait for the finger to physically lift *before* reporting the result.
+       * This makes every enroll stage a fresh press, and -- crucially -- keeps
+       * the sensor clear when the next action runs: fprintd does not start the
+       * next action (its pre-enroll duplicate check, the enroll itself, or a
+       * verify) until we report, so by then the finger is up and that action's
+       * calibration frames capture the true background instead of a lingering
+       * finger, which would otherwise poison every template built against it.
+       * It also avoids a deadlock: reporting only after the lift means the
+       * worker is never inside a finger-up USB transfer when the next action's
+       * join runs. */
+      if (!gd_wait_finger (self, FALSE, &error))
+        {
+          goodix_match_free_info (probe);
+          if (error)
+            goto err;
+          break;                    /* stop requested */
+        }
+
+      /* Hand the frame to the main thread and wait for its decision. */
       gd_resume (self, GD_RESUME_NONE);   /* arm the gate before marshalling */
       gd_marshal (self, gen, gd_idle_frame, probe, keypoints, NULL);
 
-      /* Wait for the main thread's decision first, so a completed action stops
-       * the worker immediately without a lingering finger-up USB transfer that
-       * a join at close/next-action would deadlock on. */
       if (gd_wait_resume (self) == GD_RESUME_STOP)
         break;
-
-      /* CONTINUE (another enroll stage): wait for the finger to physically lift
-       * so the next stage is a fresh press, not the same contact. */
-      if (!gd_wait_finger (self, FALSE, &error))
-        {
-          if (error)
-            goto err;
-          break;
-        }
     }
 
   gd_marshal (self, gen, gd_idle_finish, NULL, 0, NULL);
   return NULL;
 
 err:
+  /* Drop the (possibly broken) TLS session so the next action starts clean. */
+  gd_tls_deinit (self);
+
   /* libfprint discards (and replaces with a generic message) any error that is
    * not in the FpDeviceError / FpDeviceRetry domain, which would hide the real
    * cause.  Re-wrap while preserving the original message. */
