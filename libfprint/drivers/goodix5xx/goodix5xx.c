@@ -164,6 +164,8 @@ struct _FpiDeviceGoodix5xx
   GThread                  *worker;
   GdAction                  action;          /* what the worker is doing */
   gboolean                  stopping;        /* set to unblock/stop the worker (atomic) */
+  gboolean                  action_completed;/* current action already completed (main thread) */
+  guint                     generation;      /* bumped per action; stale worker marshals are ignored */
 
   /* Enroll: main thread owns these (touched only from idle callbacks). */
   GPtrArray                *enroll_features;  /* GBytes templates */
@@ -1059,11 +1061,8 @@ typedef struct
   GoodixMatchInfo    *probe;      /* extracted SIGFM features (owned), or NULL */
   int                 keypoints;
   GError             *error;      /* owned, for the error/finish paths */
+  guint               gen;        /* action generation this call belongs to */
 } GdCall;
-
-/* Track whether the current action was already completed on the main thread,
- * so the worker's terminal "finish" marshal doesn't double-complete it. */
-static gboolean gd_action_completed;
 
 /* Release the worker from its per-frame wait with the given decision. */
 static void
@@ -1076,8 +1075,8 @@ gd_resume (FpiDeviceGoodix5xx *self, GdResume r)
 }
 
 static void
-gd_marshal (FpiDeviceGoodix5xx *self, GSourceFunc fn, GoodixMatchInfo *probe,
-            int keypoints, GError *err)
+gd_marshal (FpiDeviceGoodix5xx *self, guint gen, GSourceFunc fn,
+            GoodixMatchInfo *probe, int keypoints, GError *err)
 {
   GdCall *c = g_new0 (GdCall, 1);
 
@@ -1085,7 +1084,16 @@ gd_marshal (FpiDeviceGoodix5xx *self, GSourceFunc fn, GoodixMatchInfo *probe,
   c->probe = probe;
   c->keypoints = keypoints;
   c->error = err;
+  c->gen = gen;
   g_idle_add (fn, c);
+}
+
+/* TRUE if this marshalled call belongs to a superseded action (a worker that
+ * has since been reaped); such calls must not touch the current action. */
+static gboolean
+gd_call_is_stale (GdCall *c)
+{
+  return c->gen != c->self->generation;
 }
 
 /* Complete whatever action is in progress with @error (transfers ownership). */
@@ -1094,12 +1102,12 @@ gd_complete_action (FpDevice *dev, GError *error)
 {
   FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
 
-  if (gd_action_completed)
+  if (self->action_completed)
     {
       g_clear_error (&error);
       return;
     }
-  gd_action_completed = TRUE;
+  self->action_completed = TRUE;
 
   switch (self->action)
     {
@@ -1148,13 +1156,15 @@ gd_best_score (GoodixMatchInfo *probe, FpPrint *print)
   return best;
 }
 
-/* Main-thread: an error/finish from the worker. */
+/* Main-thread: an error from the worker. */
 static gboolean
 gd_idle_error (gpointer data)
 {
   GdCall *c = data;
 
-  gd_complete_action (FP_DEVICE (c->self), g_steal_pointer (&c->error));
+  if (!gd_call_is_stale (c))
+    gd_complete_action (FP_DEVICE (c->self), g_steal_pointer (&c->error));
+  g_clear_error (&c->error);
   g_object_unref (c->self);
   g_free (c);
   return G_SOURCE_REMOVE;
@@ -1167,7 +1177,7 @@ gd_idle_finish (gpointer data)
 {
   GdCall *c = data;
 
-  if (!gd_action_completed)
+  if (!gd_call_is_stale (c) && !c->self->action_completed)
     gd_complete_action (FP_DEVICE (c->self),
                         g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
                                              "Operation cancelled"));
@@ -1205,7 +1215,7 @@ gd_finish_enroll (FpDevice *dev)
 
   g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
 
-  gd_action_completed = TRUE;
+  self->action_completed = TRUE;
   fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
 }
 
@@ -1218,6 +1228,10 @@ gd_idle_frame (gpointer data)
   FpiDeviceGoodix5xx *self = c->self;
   FpDevice *dev = FP_DEVICE (self);
   GoodixMatchInfo *probe = c->probe;
+
+  /* A frame from a superseded action (reaped worker): drop it silently. */
+  if (gd_call_is_stale (c))
+    goto out;
 
   /* Too few keypoints: ask for a re-scan (do not count this frame). */
   if (c->keypoints < GD_MIN_CAPTURE_KEYPOINTS)
@@ -1484,6 +1498,7 @@ gd_worker (gpointer data)
 {
   FpiDeviceGoodix5xx *self = data;
   GError *error = NULL;
+  guint gen = self->generation;   /* fixed for this worker's lifetime */
 
   if (!gd_full_init (self, &error))
     goto err;
@@ -1523,7 +1538,7 @@ gd_worker (gpointer data)
       /* Hand the frame to the main thread, then wait for the finger to lift and
        * for the main thread's decision before looping. */
       gd_resume (self, GD_RESUME_NONE);   /* arm the gate before marshalling */
-      gd_marshal (self, gd_idle_frame, probe, keypoints, NULL);
+      gd_marshal (self, gen, gd_idle_frame, probe, keypoints, NULL);
 
       /* Wait for the main thread's decision first, so a completed action stops
        * the worker immediately without a lingering finger-up USB transfer that
@@ -1541,7 +1556,7 @@ gd_worker (gpointer data)
         }
     }
 
-  gd_marshal (self, gd_idle_finish, NULL, 0, NULL);
+  gd_marshal (self, gen, gd_idle_finish, NULL, 0, NULL);
   return NULL;
 
 err:
@@ -1556,7 +1571,7 @@ err:
       g_error_free (error);
       error = wrapped;
     }
-  gd_marshal (self, gd_idle_error, NULL, 0, error);
+  gd_marshal (self, gen, gd_idle_error, NULL, 0, error);
   return NULL;
 }
 
@@ -1710,7 +1725,10 @@ gd_start_action (FpDevice *dev, GdAction action)
 
   gd_reap_worker (self);
 
-  gd_action_completed = FALSE;
+  /* New action generation: any still-queued idle marshals from the worker we
+   * just reaped now belong to a superseded generation and are ignored. */
+  self->generation++;
+  self->action_completed = FALSE;
   self->action = action;
   self->step_resume = GD_RESUME_NONE;
   g_atomic_int_set (&self->stopping, FALSE);
