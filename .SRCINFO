@@ -1,0 +1,26 @@
+pkgbase = libfprint-goodix5xx-git
+	pkgdesc = libfprint with an added driver for the Goodix 27c6:55a4 fingerprint sensor (SIGFM matching)
+	pkgver = 1.94.5
+	pkgrel = 1
+	url = https://github.com/Labfox/libfprint
+	arch = x86_64
+	license = LGPL-2.1-or-later
+	makedepends = meson
+	makedepends = git
+	makedepends = gobject-introspection
+	makedepends = gtk3
+	depends = glib2
+	depends = libgusb
+	depends = libgudev
+	depends = nss
+	depends = pixman
+	depends = openssl
+	depends = opencv
+	provides = libfprint=1.94.5
+	provides = libfprint-2.so
+	conflicts = libfprint
+	options = !lto
+	source = libfprint::git+https://github.com/Labfox/libfprint.git#branch=goodix5xx-55a4-support
+	sha256sums = SKIP
+
+pkgname = libfprint-goodix5xx-git

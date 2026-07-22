@@ -1,22 +1,21 @@
 # Maintainer: Labfox <labfoxdev@gmail.com>
 # libfprint fork with an added driver for the Goodix 27c6:55a4 sensor
-# (goodix5xx), ported from goodix-fp-dump.
+# (goodix5xx): TLS-PSK transport + SIFT-based (SIGFM/OpenCV) matching.
 
-pkgname=libfprint-goodix5xx
+pkgname=libfprint-goodix5xx-git
 pkgver=1.94.5
 pkgrel=1
-pkgdesc='Library for fingerprint readers (with Goodix 27c6:55a4 goodix5xx driver)'
+pkgdesc='libfprint with an added driver for the Goodix 27c6:55a4 fingerprint sensor (SIGFM matching)'
 arch=('x86_64')
-url='https://gitlab.freedesktop.org/libfprint/libfprint'
+url='https://github.com/Labfox/libfprint'
 license=('LGPL-2.1-or-later')
 depends=('glib2' 'libgusb' 'libgudev' 'nss' 'pixman' 'openssl' 'opencv')
 makedepends=('meson' 'git' 'gobject-introspection' 'gtk3')
 provides=("libfprint=$pkgver" 'libfprint-2.so')
 conflicts=('libfprint')
-# Build from the local checkout / branch that carries the driver.
-_repo='/home/labfox/Git/libfprint'
+options=('!lto')
 _branch='goodix5xx-55a4-support'
-source=("libfprint::git+file://${_repo}#branch=${_branch}")
+source=("libfprint::git+https://github.com/Labfox/libfprint.git#branch=${_branch}")
 sha256sums=('SKIP')
 
 pkgver() {
