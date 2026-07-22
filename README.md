@@ -4,11 +4,10 @@
 
 # LibFPrint
 
-This is an experimental libfprint driver implementation for Goodix drivers.
+This is an experimental libfprint fork adding drivers for Goodix fingerprint sensors.
 
-Currently in the works:
-- 27c6x5110 (80x64 resolution)
-- 27c6x55a4 (88x108 resolution, TLS)
+- **27c6:55a4** (88×108, TLS) &nbsp;—&nbsp; **working**: enrol, verify & identify via `fprintd`
+- 27c6:5110 (80×64) &nbsp;—&nbsp; in progress
 
 *LibFPrint is part of the **[FPrint][Website]** project.*
 
@@ -24,6 +23,46 @@ Currently in the works:
 [![Button Contributors]][Contributors]
 
 </div>
+
+## Status — Goodix `27c6:55a4`
+
+The `goodix5xx` driver targets the Goodix `27c6:55a4`, an 88×108 image sensor
+that speaks TLS-PSK. It was removed from libfprint's blacklist upstream but had
+no driver; this fork provides one. It is **functional end to end** on the
+author's hardware:
+
+- ✅ USB transport + message framing (ported from [goodix-fp-dump])
+- ✅ OpenSSL PSK-TLS session (the sensor is a TLS 1.2 PSK client; the host is the server)
+- ✅ Image capture — finger-down/lift detection, calibration, 12-bit decode
+- ✅ **Enrol / Verify / Identify** through `fprintd` and GNOME
+
+Because the sensor is far too small to yield the ≥10 minutiae that libfprint's
+default NBIS / Bozorth3 matcher needs, matching uses **SIGFM** — SIFT-based
+feature matching via OpenCV — instead. Enrolment stores several SIFT templates
+per finger and a probe is accepted on its best per-sample score.
+
+> **Requires OpenCV** (`opencv5` or `opencv4`) at build and runtime. This makes
+> the driver **not upstreamable as-is** — it is an out-of-tree, experimental
+> fork. Use at your own risk; it may misbehave with your device.
+
+## Development & AI assistance ("vibe-coded")
+
+Be upfront: the `goodix5xx` driver was written **almost entirely with an AI
+coding agent** — Anthropic's Claude Code, running Claude Opus 4.8. The agent
+produced the USB/framing layer, the OpenSSL PSK-TLS handshake, the image
+decode/preprocessing, the `FpImageDevice` → `FpDevice` conversion, the SIGFM
+integration, and most of the live on-device debugging (TLS silence traced to
+USB write chunking, a cross-action stale-callback bug found via fprintd logs,
+the finger-lift/calibration-pollution fix, and aligning the image pipeline with
+the reference so genuine fingers stopped scoring ~0).
+
+What was **human**: the device and all physical finger-presses / on-hardware
+testing, the direction and decisions, and review of the generated code. The
+protocol is a faithful port of the [goodix-fp-dump] Python reference, and the
+SIFT matcher in `sigfm/` comes from the [goodix-fp-linux-dev] project, which
+pioneered SIFT matching for these small Goodix sensors.
+
+Treat it accordingly: it works, but it has had **no upstream libfprint review**.
 
 ## History
 
@@ -75,6 +114,9 @@ being shipped in an open source project.
 [University Of Manchester]: https://www.manchester.ac.uk/
 [US Export Controlled]: https://fprint.freedesktop.org/us-export-control.html
 [NBIS]: http://fingerprint.nist.gov/NBIS/index.html
+
+[goodix-fp-dump]: https://github.com/goodix-fp-linux-dev/goodix-fp-dump
+[goodix-fp-linux-dev]: https://github.com/goodix-fp-linux-dev
 
 
 <!---------------------------------[ Badges ]---------------------------------->
