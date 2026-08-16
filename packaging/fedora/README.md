@@ -109,8 +109,9 @@ as root and reaches it through libgusb, so nothing extra is required.
 ## Verified
 
 `build-rpm.sh` was run end to end against `registry.fedoraproject.org/fedora:42`
-on 2026-08-16: the spec builds `libfprint`, `libfprint-devel` (plus debuginfo)
-cleanly, and the resulting RPM installs over Fedora's `libfprint-1.94.9` with
-`dnf install --allowerasing`, resolving all sonames. The `rpm-ostree` and
+on 2026-08-16, on the tree rebased onto upstream v1.94.9: the spec builds
+`libfprint`, `libfprint-devel` (plus debuginfo) cleanly, the RPM replaces
+Fedora's `libfprint-1.94.9-1.fc42` with `1.94.9-1.fc42.goodix5xx`, every soname
+resolves, and `fprintd` installs on top of it. The `rpm-ostree` and
 secureblue steps above are documented but were not exercised on this machine
 (Arch host).
