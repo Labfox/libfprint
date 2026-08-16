@@ -45,6 +45,15 @@ per finger and a probe is accepted on its best per-sample score.
 > the driver **not upstreamable as-is** — it is an out-of-tree, experimental
 > fork. Use at your own risk; it may misbehave with your device.
 
+## Installing
+
+- **Arch Linux** — the `PKGBUILD` in the repo root (`makepkg -si`), or the
+  `libfprint-goodix5xx-git` AUR package it mirrors.
+- **Fedora / secureblue / Silverblue / Kinoite** — see
+  [`packaging/fedora/`](packaging/fedora/README.md): an RPM spec plus a
+  containerised build script, and a `Containerfile` that bakes the fork into a
+  custom bootc image (the recommended route on image-based systems).
+
 ## Development & AI assistance ("vibe-coded")
 
 Be upfront: the `goodix5xx` driver was written **almost entirely with an AI
