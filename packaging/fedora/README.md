@@ -45,7 +45,7 @@ build links against the glib/OpenSSL/OpenCV sonames the deployment ships.
 
 ```bash
 packaging/fedora/build-rpm.sh            # detects the host's Fedora release
-sudo rpm-ostree override replace packaging/fedora/out/libfprint-1.94.5-*.rpm
+sudo rpm-ostree override replace packaging/fedora/out/libfprint-1.94.9-*.rpm
 sudo rpm-ostree install fprintd fprintd-pam   # if not already in your image
 systemctl reboot
 ```
@@ -62,10 +62,9 @@ sudo rpm-ostree override reset libfprint && systemctl reboot
 ```
 
 On a traditional (non-atomic) Fedora, the same script works — just install with
-`sudo dnf install packaging/fedora/out/libfprint-*.rpm`; because the fork is
-version `1.94.5` and Fedora may ship newer, use `dnf --allowerasing distro-sync`
-carefully or add `libfprint` to `excludepkgs` in `/etc/dnf/dnf.conf` so an
-update doesn't quietly replace it.
+`sudo dnf install packaging/fedora/out/libfprint-*.rpm`. Add `libfprint` to
+`excludepkgs` in `/etc/dnf/dnf.conf` so a routine update doesn't quietly put
+Fedora's build back.
 
 ## secureblue-specific notes
 
@@ -86,20 +85,19 @@ update doesn't quietly replace it.
   restricted in your configuration, run the build inside a `toolbox`/`distrobox`
   Fedora container instead — the same `build-rpm.sh` steps apply.
 
-## Version skew caveat
+## Version
 
-This fork is based on libfprint **1.94.5**; Fedora 42 ships **1.94.9**, so
-installing it is a *downgrade* of everything except the new `goodix5xx` driver.
-The soname (`libfprint-2.so.2`) and the `LIBFPRINT_2.0.0` symbol version are
-unchanged, so `fprintd` links against it fine (verified in a clean Fedora 42
-container). `rpm-ostree override replace` permits the downgrade; plain `dnf`
-needs `--allowerasing`.
+The fork is rebased on upstream **libfprint 1.94.9** — the same version Fedora
+42 ships — so replacing the distribution package costs you nothing but gains
+the `goodix5xx` driver. The RPM release carries a `.goodix5xx` suffix
+(`1.94.9-1.fc42.goodix5xx`) so it sorts above Fedora's build and is easy to
+spot in `rpm -q`.
 
 ## Runtime dependencies
 
 All pulled automatically by RPM's soname dependency generator — no manual
 `Requires:` needed. On Fedora 42 that resolves to `glib2`, `libgusb`,
-`libgudev`, `nss`, `pixman`, `openssl-libs` and the fine-grained OpenCV
+`libgudev`, `pixman`, `openssl-libs` and the fine-grained OpenCV
 subpackages (`opencv-core`, `opencv-imgproc`, `opencv-features2d`,
 `opencv-flann`, `opencv-calib3d`, `opencv-stitching`) — a few tens of MB, not
 the full `opencv` stack.

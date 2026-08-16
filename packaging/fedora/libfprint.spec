@@ -6,7 +6,7 @@
 %global drivers default
 
 Name:           libfprint
-Version:        1.94.5
+Version:        1.94.9
 Release:        1%{?dist}.%{fork_suffix}
 Summary:        Library for fingerprint readers (fork with the Goodix 27c6:55a4 driver)
 
@@ -23,7 +23,6 @@ BuildRequires:  pkgconfig(gio-unix-2.0) >= 2.56
 BuildRequires:  pkgconfig(gobject-2.0) >= 2.56
 BuildRequires:  pkgconfig(gusb) >= 0.2.0
 BuildRequires:  pkgconfig(gudev-1.0)
-BuildRequires:  pkgconfig(nss)
 BuildRequires:  pkgconfig(openssl)
 BuildRequires:  pkgconfig(pixman-1)
 BuildRequires:  pkgconfig(cairo)
@@ -32,7 +31,7 @@ BuildRequires:  pkgconfig(opencv4)
 BuildRequires:  gobject-introspection-devel
 BuildRequires:  systemd-rpm-macros
 
-# Runtime deps (glib2, libgusb, libgudev, nss, pixman, openssl-libs and the
+# Runtime deps (glib2, libgusb, libgudev, pixman, openssl-libs and the
 # OpenCV libs the SIGFM matcher links) are picked up automatically by RPM's
 # soname dependency generator; on Fedora 42 that resolves to opencv-core,
 # opencv-imgproc, opencv-features2d, opencv-flann and friends.
@@ -90,5 +89,5 @@ test -f %{buildroot}%{_libdir}/libfprint-2.so.2
 %{_datadir}/gir-1.0/FPrint-2.0.gir
 
 %changelog
-* Sun Aug 16 2026 Labfox <labfoxdev@gmail.com> - 1.94.5-1.goodix5xx
+* Sun Aug 16 2026 Labfox <labfoxdev@gmail.com> - 1.94.9-1.goodix5xx
 - Initial Fedora/secureblue packaging of the goodix5xx fork
