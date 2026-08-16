@@ -63,7 +63,8 @@ Header files, pkg-config file and GObject introspection XML for %{name}.
     -Dgtk-examples=false \
     -Dudev_rules=enabled \
     -Dudev_rules_dir=%{_udevrulesdir} \
-    -Dudev_hwdb=disabled
+    -Dudev_hwdb=disabled \
+    -Dinstalled-tests=false
 %meson_build
 
 %install
@@ -81,6 +82,7 @@ test -f %{buildroot}%{_libdir}/libfprint-2.so.2
 %{_libdir}/libfprint-2.so.2.*
 %{_libdir}/girepository-1.0/FPrint-2.0.typelib
 %{_udevrulesdir}/70-libfprint-2.rules
+%{_datadir}/metainfo/org.freedesktop.libfprint.metainfo.xml
 
 %files devel
 %{_includedir}/libfprint-2/
