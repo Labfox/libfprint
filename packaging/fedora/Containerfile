@@ -1,0 +1,52 @@
+# Build a custom secureblue/Fedora Atomic image with the goodix5xx libfprint.
+#
+# This is the durable way to run the fork on an image-based system: the
+# replacement is baked into the image, so it survives `bootc upgrade` /
+# `rpm-ostree upgrade` instead of being a local override you must maintain.
+#
+# Build:
+#   podman build -f packaging/fedora/Containerfile -t localhost/secureblue-goodix5xx .
+# Rebase:
+#   sudo bootc switch --transport containers-storage localhost/secureblue-goodix5xx
+#   (or push to a registry and `sudo bootc switch <registry>/<image>:<tag>`)
+#
+# Pick the secureblue image you are actually running:
+#   rpm-ostree status | grep -m1 Image   # or: bootc status
+ARG BASE_IMAGE=ghcr.io/secureblue/silverblue-main-hardened:latest
+ARG FEDORA_RELEASE=42
+
+########################################
+# Stage 1 - build the RPMs
+########################################
+FROM registry.fedoraproject.org/fedora:${FEDORA_RELEASE} AS builder
+
+RUN dnf -y install rpm-build rpmdevtools dnf-plugins-core git-core && dnf clean all
+
+WORKDIR /src
+COPY . /src
+
+RUN set -eux; \
+    version=$(grep -m1 -oP "version:\s*'\K[0-9.]+" meson.build); \
+    rpmdev-setuptree; \
+    git config --global --add safe.directory /src; \
+    git archive --format=tar.gz --prefix="libfprint-${version}/" \
+        -o ~/rpmbuild/SOURCES/libfprint-${version}.tar.gz HEAD; \
+    cp packaging/fedora/libfprint.spec ~/rpmbuild/SPECS/; \
+    dnf -y builddep ~/rpmbuild/SPECS/libfprint.spec; \
+    rpmbuild -bb ~/rpmbuild/SPECS/libfprint.spec; \
+    mkdir -p /rpms; \
+    cp ~/rpmbuild/RPMS/*/libfprint-[0-9]*.rpm /rpms/
+
+########################################
+# Stage 2 - layer them onto secureblue
+########################################
+FROM ${BASE_IMAGE}
+
+COPY --from=builder /rpms /tmp/rpms
+
+# `override replace` swaps the base image's libfprint for ours; fprintd and
+# opencv-core are pulled from the Fedora repos as needed.
+RUN rpm-ostree override replace /tmp/rpms/libfprint-[0-9]*.rpm && \
+    rpm-ostree install fprintd fprintd-pam && \
+    rm -rf /tmp/rpms && \
+    ostree container commit

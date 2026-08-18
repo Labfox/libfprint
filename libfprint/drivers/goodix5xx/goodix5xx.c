@@ -1,0 +1,1853 @@
+/*
+ * Goodix 55x4 (TLS image sensor) driver for libfprint
+ *
+ * Copyright (C) 2026 Labfox
+ *
+ * Protocol ported faithfully from the goodix-fp-dump python reference
+ * (goodix.py / driver_55x4.py).
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+#define FP_COMPONENT "goodix5xx"
+
+#include <string.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+#include "drivers_api.h"
+#include "fpi-print.h"
+#include "goodix5xx.h"
+#include "goodix5xx-match.h"
+
+/* ------------------------------------------------------------------ *
+ *  Device constants (driver_55x4.py)
+ * ------------------------------------------------------------------ */
+
+/* The interface and bulk endpoints are discovered from the descriptors at
+ * open time (protocol.py does the same), and stored on the device. */
+#define GD_USB_CLASS_CDC_DATA   0x0a
+#define GD_USB_CLASS_VENDOR     0xff
+
+#define GD_SENSOR_WIDTH         88
+#define GD_SENSOR_HEIGHT        108
+
+/* Raster geometry of the decoded frame.  tool.write_pgm() groups the pixel
+ * stream into lines of length SENSOR_HEIGHT, so the actual raster is
+ * SENSOR_HEIGHT wide by SENSOR_WIDTH tall. */
+#define GD_IMAGE_WIDTH          GD_SENSOR_HEIGHT
+#define GD_IMAGE_HEIGHT         GD_SENSOR_WIDTH
+
+/* Pixels in the decoded 8-bit frame. */
+#define GD_IMAGE_PIXELS         (GD_IMAGE_WIDTH * GD_IMAGE_HEIGHT)
+
+/* SENSOR_WIDTH * SENSOR_HEIGHT / 4 * 6 + 4 (see tool.decode_image) */
+#define GD_IMAGE_BYTES          ((GD_SENSOR_WIDTH * GD_SENSOR_HEIGHT / 4 * 6) + 4)
+
+#define GD_USB_TIMEOUT          5000    /* ms */
+#define GD_USB_PACKET_SIZE      0x40    /* bulk wMaxPacketSize; writes are chunked to this */
+#define GD_FINGER_POLL_TIMEOUT  2000    /* ms */
+#define GD_READ_BUF_SIZE        0x10000
+
+/* SIGFM matching parameters (goodix-fp-linux-dev goodix53x5 reference).  The
+ * 88x108 sensor yields far too few NBIS minutiae for bozorth3, so matching is
+ * done with the SIFT-based SIGFM matcher instead.  Enrollment collects several
+ * samples covering different sub-regions of the finger; a probe is accepted if
+ * its best score against any single enrolled sample clears the threshold. */
+#define GD_ENROLL_SAMPLES          8
+#define GD_SIGFM_BEST_MIN          150   /* accept if best single-sample score >= this */
+#define GD_MIN_CAPTURE_KEYPOINTS   20    /* reject captures with fewer SIFT keypoints */
+
+/* PSK / whitebox key material (driver_55x4.py) */
+static const guint8 GD_PSK[32] = { 0 };
+
+static const guint8 GD_PSK_WHITE_BOX[] = {
+  0xec, 0x35, 0xae, 0x3a, 0xbb, 0x45, 0xed, 0x3f, 0x12, 0xc4, 0x75, 0x1f,
+  0x1e, 0x5c, 0x2c, 0xc0, 0x5b, 0x3c, 0x54, 0x52, 0xe9, 0x10, 0x4d, 0x9f,
+  0x2a, 0x31, 0x18, 0x64, 0x4f, 0x37, 0xa0, 0x4b, 0x6f, 0xd6, 0x6b, 0x1d,
+  0x97, 0xcf, 0x80, 0xf1, 0x34, 0x5f, 0x76, 0xc8, 0x4f, 0x03, 0xff, 0x30,
+  0xbb, 0x51, 0xbf, 0x30, 0x8f, 0x2a, 0x98, 0x75, 0xc4, 0x1e, 0x65, 0x92,
+  0xcd, 0x2a, 0x2f, 0x9e, 0x60, 0x80, 0x9b, 0x17, 0xb5, 0x31, 0x60, 0x37,
+  0xb6, 0x9b, 0xb2, 0xfa, 0x5d, 0x4c, 0x8a, 0xc3, 0x1e, 0xdb, 0x33, 0x94,
+  0x04, 0x6e, 0xc0, 0x6b, 0xbd, 0xac, 0xc5, 0x7d, 0xa6, 0xa7, 0x56, 0xc5,
+};
+
+static const guint8 GD_PMK_HASH[32] = {
+  0x81, 0xb8, 0xff, 0x49, 0x06, 0x12, 0x02, 0x2a, 0x12, 0x1a, 0x94, 0x49,
+  0xee, 0x3a, 0xad, 0x27, 0x92, 0xf3, 0x2b, 0x9f, 0x31, 0x41, 0x18, 0x2c,
+  0xd0, 0x10, 0x19, 0x94, 0x5e, 0xe5, 0x03, 0x61,
+};
+
+/* DEVICE_CONFIG (driver_55x4.py) - 256 bytes */
+static const guint8 GD_DEVICE_CONFIG[] = {
+  0x60, 0x11, 0x60, 0x71, 0x24, 0x95, 0x2c, 0xc1, 0x14, 0xd5, 0x10, 0xe5,
+  0x00, 0xe5, 0x14, 0xf9, 0x03, 0x04, 0x02, 0x00, 0x00, 0x08, 0x00, 0x11,
+  0x11, 0xba, 0x00, 0x01, 0x80, 0xca, 0x00, 0x07, 0x00, 0x84, 0x00, 0xc0,
+  0xb3, 0x86, 0x00, 0xbb, 0xc4, 0x88, 0x00, 0xba, 0xba, 0x8a, 0x00, 0xb2,
+  0xb2, 0x8c, 0x00, 0xaa, 0xaa, 0x8e, 0x00, 0xc1, 0xc1, 0x90, 0x00, 0xbb,
+  0xbb, 0x92, 0x00, 0xb1, 0xb1, 0x94, 0x00, 0x00, 0xa8, 0x96, 0x00, 0x00,
+  0xb6, 0x98, 0x00, 0x00, 0xbf, 0x9a, 0x00, 0x00, 0xba, 0x50, 0x00, 0x01,
+  0x05, 0xd0, 0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x72, 0x00, 0x78,
+  0x56, 0x74, 0x00, 0x34, 0x12, 0x26, 0x00, 0x00, 0x12, 0x20, 0x00, 0x10,
+  0x40, 0x12, 0x00, 0x03, 0x04, 0x2a, 0x01, 0x02, 0x00, 0x22, 0x00, 0x01,
+  0x20, 0x24, 0x00, 0x32, 0x00, 0x80, 0x00, 0x01, 0x00, 0x5c, 0x00, 0x80,
+  0x00, 0x56, 0x00, 0x08, 0x20, 0x58, 0x00, 0x01, 0x00, 0x32, 0x00, 0x2c,
+  0x02, 0x82, 0x00, 0x80, 0x0c, 0xba, 0x00, 0x01, 0x80, 0xca, 0x00, 0x07,
+  0x00, 0x2a, 0x01, 0x82, 0x03, 0x20, 0x00, 0x10, 0x40, 0x22, 0x00, 0x01,
+  0x20, 0x24, 0x00, 0x14, 0x00, 0x80, 0x00, 0x05, 0x00, 0x5c, 0x00, 0x00,
+  0x01, 0x56, 0x00, 0x08, 0x20, 0x58, 0x00, 0x03, 0x00, 0x82, 0x00, 0x80,
+  0x14, 0x2a, 0x01, 0x08, 0x00, 0x5c, 0x00, 0x80, 0x00, 0x62, 0x00, 0x09,
+  0x03, 0x64, 0x00, 0x18, 0x00, 0x22, 0x00, 0x00, 0x20, 0x2a, 0x01, 0x08,
+  0x00, 0x5c, 0x00, 0x00, 0x01, 0x52, 0x00, 0x08, 0x00, 0x54, 0x00, 0x00,
+  0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x9a, 0x69,
+};
+
+/* FDT payloads (driver_55x4.py) */
+static const guint8 GD_FDT_MODE[] = {
+  0x0d, 0x01, 0x80, 0x12, 0x80, 0x12, 0x80, 0x98, 0x80, 0x82, 0x80, 0x12,
+  0x80, 0xa0, 0x80, 0x99, 0x80, 0x7f, 0x80, 0x12, 0x80, 0x9f, 0x80, 0x93,
+  0x80, 0x7e,
+};
+
+static const guint8 GD_FDT_DOWN[] = {
+  0x0c, 0x01, 0x80, 0xb0, 0x80, 0xc4, 0x80, 0xba, 0x80, 0xa6, 0x80, 0xb7,
+  0x80, 0xc7, 0x80, 0xc0, 0x80, 0xaa, 0x80, 0xb4, 0x80, 0xc4, 0x80, 0xba,
+  0x80, 0xa6,
+};
+
+/* Finger-up detector.  The 55x4 python reference never lifts (it captures a
+ * single frame), so there is no reference payload; following the observed
+ * Goodix convention (fdt down=0x0c, mode=0x0d, up=0x0e -- see driver_51x7 /
+ * driver_5503) this reuses the fdt-down thresholds with the up opcode byte. */
+static const guint8 GD_FDT_UP[] = {
+  0x0e, 0x01, 0x80, 0xb0, 0x80, 0xc4, 0x80, 0xba, 0x80, 0xa6, 0x80, 0xb7,
+  0x80, 0xc7, 0x80, 0xc0, 0x80, 0xaa, 0x80, 0xb4, 0x80, 0xc4, 0x80, 0xba,
+  0x80, 0xa6,
+};
+
+/* ------------------------------------------------------------------ */
+
+/* Worker action mode. */
+typedef enum
+{
+  GD_ACT_ENROLL,
+  GD_ACT_VERIFY,
+  GD_ACT_IDENTIFY,
+} GdAction;
+
+/* Handshake between worker and main thread after each captured enroll frame. */
+typedef enum
+{
+  GD_RESUME_NONE = 0,   /* main thread has not decided yet */
+  GD_RESUME_CONTINUE,   /* capture another frame */
+  GD_RESUME_STOP,       /* stop the worker (action finished / cancelled) */
+} GdResume;
+
+struct _FpiDeviceGoodix5xx
+{
+  FpDevice                  parent;
+
+  GThread                  *worker;
+  GdAction                  action;          /* what the worker is doing */
+  gboolean                  stopping;        /* set to unblock/stop the worker (atomic) */
+  gboolean                  worker_done;     /* worker has finished and may be joined (atomic) */
+  gboolean                  action_completed;/* current action already completed (main thread) */
+  guint                     generation;      /* bumped per action; stale worker marshals are ignored */
+
+  /* Enroll: main thread owns these (touched only from idle callbacks). */
+  GPtrArray                *enroll_features;  /* GBytes templates */
+  gint                      enroll_stage;    /* good samples collected so far */
+
+  /* Per-frame worker<->main gate (enroll loop). */
+  GMutex                    step_mutex;
+  GCond                     step_cond;
+  gint                      step_resume;     /* GdResume */
+
+  GUsbDevice               *usb;
+  guint8                   *read_buf;      /* GD_READ_BUF_SIZE */
+  guint16                  *bg;            /* 12-bit no-finger calibration frame (npix), or NULL */
+
+  guint8                    iface;         /* claimed interface number */
+  guint8                    ep_in;         /* bulk IN endpoint address */
+  guint8                    ep_out;        /* bulk OUT endpoint address */
+
+  /* TLS.  The host acts as the PSK-TLS *server* and the device is the client,
+   * exactly like the python reference which shells out to `openssl s_server`.
+   * We use OpenSSL (not GnuTLS) so the ServerHello is byte-for-byte what the
+   * device's minimal TLS client expects -- most importantly an *empty*
+   * session_id, which GnuTLS cannot emit for a TLS 1.2 server. */
+  SSL_CTX                  *tls_ctx;
+  SSL                      *tls_ssl;
+  BIO                      *tls_net_bio;   /* our half of the BIO pair */
+  gboolean                  tls_ready;
+
+  /* Each handshake flight is buffered and sent as a single message pack (the
+   * python reference wraps one openssl read into one pack). */
+  GByteArray               *push_buf;
+};
+
+G_DEFINE_TYPE (FpiDeviceGoodix5xx, fpi_device_goodix5xx, FP_TYPE_DEVICE)
+
+/* ================================================================== *
+ *  Raw USB message framing
+ * ================================================================== */
+
+/* Build encode_message_pack(payload, flags) into a freshly allocated,
+ * 0x40-padded buffer.  *out_len is the padded length. */
+static guint8 *
+gd_build_pack (guint8 flags, const guint8 *payload, gsize payload_len,
+               gsize *out_len)
+{
+  gsize raw = 4 + payload_len;
+  gsize padded = (raw + 0x3f) & ~((gsize) 0x3f);
+  guint8 *buf = g_malloc0 (padded);
+
+  buf[0] = flags;
+  buf[1] = payload_len & 0xff;
+  buf[2] = (payload_len >> 8) & 0xff;
+  buf[3] = (buf[0] + buf[1] + buf[2]) & 0xff;
+  if (payload_len)
+    memcpy (buf + 4, payload, payload_len);
+
+  *out_len = padded;
+  return buf;
+}
+
+/* encode_message_protocol(payload, command, checksum=True) */
+static guint8 *
+gd_build_protocol (guint8 command, const guint8 *payload, gsize payload_len,
+                   gsize *out_len)
+{
+  gsize len = 3 + payload_len + 1;
+  guint8 *buf = g_malloc0 (len);
+  guint sum = 0;
+  gsize i;
+
+  buf[0] = command;
+  buf[1] = (payload_len + 1) & 0xff;
+  buf[2] = ((payload_len + 1) >> 8) & 0xff;
+  if (payload_len)
+    memcpy (buf + 3, payload, payload_len);
+
+  for (i = 0; i < 3 + payload_len; i++)
+    sum += buf[i];
+  buf[3 + payload_len] = (0xaa - sum) & 0xff;
+
+  *out_len = len;
+  return buf;
+}
+
+static gboolean
+gd_usb_write (FpiDeviceGoodix5xx *self, const guint8 *data, gsize len,
+              GError **error)
+{
+  gsize off;
+
+  /* The device firmware requires each bulk-OUT transfer to be at most one
+   * wMaxPacketSize (0x40); the python reference writes `data[i:i+0x40]` in a
+   * loop.  A single larger transfer (e.g. the 128-byte ServerHello flight) is
+   * silently dropped -- the firmware only processes the first packet and then
+   * waits forever.  Split the (already 0x40-padded) buffer accordingly. */
+  for (off = 0; off < len; off += GD_USB_PACKET_SIZE)
+    {
+      gsize chunk = MIN ((gsize) GD_USB_PACKET_SIZE, len - off);
+
+      if (!g_usb_device_bulk_transfer (self->usb, self->ep_out,
+                                       (guint8 *) data + off, chunk, NULL,
+                                       GD_USB_TIMEOUT, NULL, error))
+        return FALSE;
+    }
+  return TRUE;
+}
+
+/* Send a raw message pack (flags + payload). */
+static gboolean
+gd_send_pack (FpiDeviceGoodix5xx *self, guint8 flags,
+              const guint8 *payload, gsize payload_len, GError **error)
+{
+  g_autofree guint8 *buf = NULL;
+  gsize len;
+
+  buf = gd_build_pack (flags, payload, payload_len, &len);
+  return gd_usb_write (self, buf, len, error);
+}
+
+/* Send a message-protocol command wrapped in a 0xa0 pack. */
+static gboolean
+gd_send_cmd (FpiDeviceGoodix5xx *self, guint8 command,
+             const guint8 *payload, gsize payload_len, GError **error)
+{
+  g_autofree guint8 *proto = NULL;
+  gsize proto_len;
+
+  proto = gd_build_protocol (command, payload, payload_len, &proto_len);
+  return gd_send_pack (self, GD_FLAGS_MESSAGE_PROTOCOL, proto, proto_len, error);
+}
+
+/* Discard any pending IN data so the next exchange starts in sync
+ * (goodix.py Device.empty_buffer). */
+static void
+gd_drain (FpiDeviceGoodix5xx *self)
+{
+  gsize actual;
+  GError *error = NULL;
+
+  while (g_usb_device_bulk_transfer (self->usb, self->ep_in, self->read_buf,
+                                     GD_READ_BUF_SIZE, &actual, 100,
+                                     NULL, &error))
+    ;                             /* keep reading until it times out / errors */
+  g_clear_error (&error);
+}
+
+/* Read one message pack.  Returns the pack payload in self->read_buf+4;
+ * *flags and *payload_len describe it.  The pointer stays valid until the
+ * next read. */
+static const guint8 *
+gd_read_pack (FpiDeviceGoodix5xx *self, guint timeout, guint8 *flags,
+              gsize *payload_len, GError **error)
+{
+  gsize actual = 0;
+
+  if (!g_usb_device_bulk_transfer (self->usb, self->ep_in, self->read_buf,
+                                   GD_READ_BUF_SIZE, &actual, timeout,
+                                   NULL, error))
+    return NULL;
+
+  if (actual < 4)
+    {
+      g_set_error_literal (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                           "Short message pack");
+      return NULL;
+    }
+
+  if (((self->read_buf[0] + self->read_buf[1] + self->read_buf[2]) & 0xff)
+      != self->read_buf[3])
+    {
+      g_set_error_literal (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                           "Bad message pack checksum");
+      return NULL;
+    }
+
+  *flags = self->read_buf[0];
+  *payload_len = self->read_buf[1] | (self->read_buf[2] << 8);
+  if (*payload_len > actual - 4)
+    *payload_len = actual - 4;
+
+  return self->read_buf + 4;
+}
+
+/* Read and validate the ACK for a given command. */
+static gboolean
+gd_read_ack (FpiDeviceGoodix5xx *self, guint8 command, GError **error)
+{
+  const guint8 *payload;
+  guint8 flags;
+  gsize plen;
+  guint16 body_len;
+
+  payload = gd_read_pack (self, GD_USB_TIMEOUT, &flags, &plen, error);
+  if (!payload)
+    return FALSE;
+
+  /* payload = message-protocol packet: [cmd][len16][body][cksum] */
+  if (plen < 4 || payload[0] != GD_CMD_ACK)
+    {
+      g_set_error_literal (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                           "Expected ACK packet");
+      return FALSE;
+    }
+
+  body_len = payload[1] | (payload[2] << 8);
+  if (body_len < 2 || plen < 3 + (gsize) body_len)
+    {
+      g_set_error_literal (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                           "Malformed ACK packet");
+      return FALSE;
+    }
+
+  /* body = [acked_command][flags]; flags bit0 must be set. */
+  if (payload[3] != command || !(payload[4] & 0x1))
+    {
+      g_set_error (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                   "Unexpected ACK for command 0x%02x (got 0x%02x)",
+                   command, payload[3]);
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+/* Read a message-protocol reply for @command; returns a copy of the body. */
+static guint8 *
+gd_read_cmd_reply (FpiDeviceGoodix5xx *self, guint8 command,
+                   gsize *body_len_out, GError **error)
+{
+  const guint8 *payload;
+  guint8 flags;
+  gsize plen;
+  guint16 body_len;
+
+  payload = gd_read_pack (self, GD_USB_TIMEOUT, &flags, &plen, error);
+  if (!payload)
+    return NULL;
+
+  if (plen < 3 || payload[0] != command)
+    {
+      g_set_error (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                   "Unexpected reply command 0x%02x (want 0x%02x)",
+                   plen ? payload[0] : 0, command);
+      return NULL;
+    }
+
+  body_len = payload[1] | (payload[2] << 8);
+  if (body_len < 1)
+    body_len = 1;
+  body_len -= 1;                 /* decode_message_protocol length - 1 */
+  if (body_len > plen - 3)
+    body_len = plen - 3;
+
+  *body_len_out = body_len;
+  return g_memdup2 (payload + 3, body_len);
+}
+
+/* Send a command, read its ACK, then read its reply body. */
+static guint8 *
+gd_exec (FpiDeviceGoodix5xx *self, guint8 command,
+         const guint8 *payload, gsize payload_len,
+         gsize *reply_len, GError **error)
+{
+  if (!gd_send_cmd (self, command, payload, payload_len, error))
+    return NULL;
+  if (!gd_read_ack (self, command, error))
+    return NULL;
+  return gd_read_cmd_reply (self, command, reply_len, error);
+}
+
+/* Send a command and only read the ACK (no reply body expected). */
+static gboolean
+gd_exec_ack_only (FpiDeviceGoodix5xx *self, guint8 command,
+                  const guint8 *payload, gsize payload_len, GError **error)
+{
+  if (!gd_send_cmd (self, command, payload, payload_len, error))
+    return FALSE;
+  return gd_read_ack (self, command, error);
+}
+
+/* ================================================================== *
+ *  OpenSSL transport (host acts as PSK-TLS server, device is client)
+ *
+ *  This mirrors the python reference, which runs `openssl s_server
+ *  -nocert -psk <32 zero bytes>`.  OpenSSL is driven with a BIO pair: the
+ *  SSL object talks to one half, and we shuttle bytes between the other
+ *  half (tls_net_bio) and the device's message packs.  Each outbound
+ *  handshake flight is coalesced into a single message pack.
+ * ================================================================== */
+
+/* Send whatever push output has been buffered as a single message pack.
+ * Returns FALSE on USB failure. */
+static gboolean
+gd_tls_flush (FpiDeviceGoodix5xx *self, GError **error)
+{
+  gboolean ok = TRUE;
+
+  if (self->push_buf && self->push_buf->len)
+    {
+      fp_dbg ("TLS -> device: %u byte flight", self->push_buf->len);
+      ok = gd_send_pack (self, GD_FLAGS_TLS, self->push_buf->data,
+                         self->push_buf->len, error);
+      g_byte_array_set_size (self->push_buf, 0);
+    }
+  return ok;
+}
+
+/* Drain any TLS bytes OpenSSL has produced into the flight buffer. */
+static void
+gd_tls_pump (FpiDeviceGoodix5xx *self)
+{
+  char buf[4096];
+  int n;
+
+  while ((n = BIO_read (self->tls_net_bio, buf, sizeof (buf))) > 0)
+    g_byte_array_append (self->push_buf, (const guint8 *) buf, n);
+}
+
+/* Read one message pack from the device and feed its TLS payload to OpenSSL. */
+static gboolean
+gd_tls_feed (FpiDeviceGoodix5xx *self, GError **error)
+{
+  const guint8 *payload;
+  guint8 flags;
+  gsize plen;
+  gsize skip;
+
+  payload = gd_read_pack (self, GD_USB_TIMEOUT, &flags, &plen, error);
+  if (!payload)
+    return FALSE;
+
+  fp_dbg ("TLS <- device: pack flags 0x%02x, %zu bytes", flags, plen);
+
+  /* 0xb0 packs carry raw TLS records; 0xb2 image-data packs prefix the
+   * TLS record with a 9-byte header (see driver_55x4.py "[9:]"). */
+  skip = (flags == GD_FLAGS_TLS_DATA) ? 9 : 0;
+  if (plen < skip)
+    plen = skip;
+
+  if (plen > skip)
+    BIO_write (self->tls_net_bio, payload + skip, (int) (plen - skip));
+  return TRUE;
+}
+
+/* Trace every TLS record (both directions) so the exact ServerHello /
+ * ClientHello bytes are visible in the debug log. */
+static void
+gd_tls_msg_cb (int write_p, int version, int content_type,
+               const void *buf, size_t len, SSL *ssl, void *arg)
+{
+  GString *hex = g_string_new (NULL);
+  const guint8 *b = buf;
+  size_t i;
+
+  for (i = 0; i < len && i < 256; i++)
+    g_string_append_printf (hex, "%02x", b[i]);
+  fp_dbg ("TLS msg %s ct=%d ver=0x%04x (%zu bytes): %s",
+          write_p ? "OUT" : "IN", content_type, version, len, hex->str);
+  g_string_free (hex, TRUE);
+}
+
+static unsigned int
+gd_tls_psk_server_cb (SSL *ssl, const char *identity, unsigned char *psk,
+                      unsigned int max_psk_len)
+{
+  if (max_psk_len < sizeof (GD_PSK))
+    return 0;
+  memcpy (psk, GD_PSK, sizeof (GD_PSK));
+  return sizeof (GD_PSK);
+}
+
+static void
+gd_tls_set_ossl_error (GError **error, const char *what)
+{
+  unsigned long e = ERR_peek_last_error ();
+  char ebuf[256] = "";
+
+  if (e)
+    ERR_error_string_n (e, ebuf, sizeof (ebuf));
+  g_set_error (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+               "%s: %s", what, e ? ebuf : "unknown error");
+}
+
+static gboolean
+gd_tls_handshake (FpiDeviceGoodix5xx *self, GError **error)
+{
+  BIO *internal_bio = NULL;
+
+  if (!self->push_buf)
+    self->push_buf = g_byte_array_new ();
+  g_byte_array_set_size (self->push_buf, 0);
+
+  self->tls_ctx = SSL_CTX_new (TLS_server_method ());
+  if (!self->tls_ctx)
+    {
+      gd_tls_set_ossl_error (error, "SSL_CTX_new failed");
+      return FALSE;
+    }
+
+  /* Match the reference `openssl s_server` exactly: leave the maximum version
+   * at TLS 1.3 so OpenSSL, when the device (TLS 1.2 only, no supported_versions)
+   * makes it negotiate down to TLS 1.2, writes the RFC 8446 downgrade sentinel
+   * ("DOWNGRD\x01") into the last 8 bytes of ServerHello.random.  Capping the
+   * maximum at TLS 1.2 omits that sentinel, and the device's firmware rejects
+   * the resulting ServerHello (stays silent). */
+  SSL_CTX_set_min_proto_version (self->tls_ctx, TLS1_2_VERSION);
+  SSL_CTX_set_max_proto_version (self->tls_ctx, TLS1_3_VERSION);
+  /* PSK-AES128-CBC-SHA256 (0x00AE) is the only suite the device offers; drop
+   * the security level so OpenSSL keeps this non-forward-secret PSK suite. */
+  SSL_CTX_set_security_level (self->tls_ctx, 0);
+  if (SSL_CTX_set_cipher_list (self->tls_ctx, "PSK-AES128-CBC-SHA256") != 1)
+    {
+      gd_tls_set_ossl_error (error, "SSL_CTX_set_cipher_list failed");
+      return FALSE;
+    }
+  SSL_CTX_set_psk_server_callback (self->tls_ctx, gd_tls_psk_server_cb);
+
+  self->tls_ssl = SSL_new (self->tls_ctx);
+  if (!self->tls_ssl)
+    {
+      gd_tls_set_ossl_error (error, "SSL_new failed");
+      return FALSE;
+    }
+  SSL_set_accept_state (self->tls_ssl);
+  SSL_set_msg_callback (self->tls_ssl, gd_tls_msg_cb);
+  SSL_set_msg_callback_arg (self->tls_ssl, self);
+
+  if (BIO_new_bio_pair (&internal_bio, 0, &self->tls_net_bio, 0) != 1)
+    {
+      gd_tls_set_ossl_error (error, "BIO_new_bio_pair failed");
+      return FALSE;
+    }
+  /* SSL takes ownership of internal_bio; tls_net_bio is freed separately. */
+  SSL_set_bio (self->tls_ssl, internal_bio, internal_bio);
+
+  /* Tell the device to start its TLS client handshake. */
+  if (!gd_exec_ack_only (self, GD_CMD_REQUEST_TLS_CONNECTION,
+                         (const guint8 *) "\x00\x00", 2, error))
+    return FALSE;
+
+  for (;;)
+    {
+      int ret = SSL_do_handshake (self->tls_ssl);
+      int err;
+
+      gd_tls_pump (self);
+
+      if (ret == 1)
+        {
+          /* Final server flight (ChangeCipherSpec + Finished). */
+          if (!gd_tls_flush (self, error))
+            return FALSE;
+          break;
+        }
+
+      err = SSL_get_error (self->tls_ssl, ret);
+      if (err == SSL_ERROR_WANT_READ)
+        {
+          if (!gd_tls_flush (self, error))
+            return FALSE;
+          if (!gd_tls_feed (self, error))
+            return FALSE;
+        }
+      else if (err == SSL_ERROR_WANT_WRITE)
+        {
+          if (!gd_tls_flush (self, error))
+            return FALSE;
+        }
+      else
+        {
+          gd_tls_set_ossl_error (error, "TLS handshake failed");
+          return FALSE;
+        }
+    }
+
+  self->tls_ready = TRUE;
+  fp_dbg ("TLS handshake complete");
+  return TRUE;
+}
+
+static void
+gd_tls_deinit (FpiDeviceGoodix5xx *self)
+{
+  if (self->tls_ready && self->tls_ssl)
+    {
+      SSL_shutdown (self->tls_ssl);
+      self->tls_ready = FALSE;
+    }
+  g_clear_pointer (&self->tls_ssl, SSL_free);   /* also frees internal BIO */
+  g_clear_pointer (&self->tls_net_bio, BIO_free);
+  g_clear_pointer (&self->tls_ctx, SSL_CTX_free);
+  if (self->push_buf)
+    {
+      g_byte_array_free (self->push_buf, TRUE);
+      self->push_buf = NULL;
+    }
+}
+
+/* ================================================================== *
+ *  High level protocol operations (driver_55x4.py)
+ * ================================================================== */
+
+static gboolean
+gd_op_nop (FpiDeviceGoodix5xx *self, GError **error)
+{
+  /* NOP has no checksum and returns nothing meaningful; just fire it. */
+  g_autofree guint8 *proto = NULL;
+  gsize proto_len;
+  static const guint8 body[4] = { 0 };
+
+  /* encode_message_protocol(..., checksum=False) => trailing 0x88 */
+  proto = gd_build_protocol (GD_CMD_NOP, body, sizeof (body), &proto_len);
+  proto[proto_len - 1] = 0x88;
+  return gd_send_pack (self, GD_FLAGS_MESSAGE_PROTOCOL, proto, proto_len, error);
+}
+
+static gboolean
+gd_op_firmware_version (FpiDeviceGoodix5xx *self, gchar **version, GError **error)
+{
+  g_autofree guint8 *reply = NULL;
+  gsize len = 0;
+
+  reply = gd_exec (self, GD_CMD_FIRMWARE_VERSION,
+                   (const guint8 *) "\x00\x00", 2, &len, error);
+  if (!reply)
+    return FALSE;
+
+  *version = g_strndup ((const gchar *) reply, len);
+  return TRUE;
+}
+
+static gboolean
+gd_op_check_psk (FpiDeviceGoodix5xx *self, gboolean *valid, GError **error)
+{
+  g_autofree guint8 *reply = NULL;
+  gsize len = 0;
+  guint8 payload[8];
+  guint32 psk_len, flags;
+
+  /* preset_psk_read(0xbb020007): le32(flags) + le32(0) */
+  payload[0] = 0x07; payload[1] = 0x00; payload[2] = 0x02; payload[3] = 0xbb;
+  payload[4] = payload[5] = payload[6] = payload[7] = 0x00;
+
+  reply = gd_exec (self, GD_CMD_PRESET_PSK_READ, payload, sizeof (payload),
+                   &len, error);
+  if (!reply)
+    return FALSE;
+
+  *valid = FALSE;
+  if (len < 9 || reply[0] != 0x00)
+    return TRUE;
+
+  /* check_psk() also requires the returned flags to match. */
+  flags = reply[1] | (reply[2] << 8) | (reply[3] << 16) | (reply[4] << 24);
+  if (flags != 0xbb020007)
+    return TRUE;
+
+  psk_len = reply[5] | (reply[6] << 8) | (reply[7] << 16) | (reply[8] << 24);
+  if (len < 9 + psk_len)
+    return TRUE;
+
+  if (psk_len == sizeof (GD_PMK_HASH) &&
+      memcmp (reply + 9, GD_PMK_HASH, sizeof (GD_PMK_HASH)) == 0)
+    *valid = TRUE;
+
+  return TRUE;
+}
+
+static gboolean
+gd_op_write_psk (FpiDeviceGoodix5xx *self, GError **error)
+{
+  g_autofree guint8 *reply = NULL;
+  g_autofree guint8 *payload = NULL;
+  gsize len = 0;
+  guint32 flags = 0xbb010003;
+  guint32 wblen = sizeof (GD_PSK_WHITE_BOX);
+  gsize plen = 8 + wblen;
+
+  /* preset_psk_write(0xbb010003, PSK_WHITE_BOX):
+   *   le32(flags) + le32(len) + payload */
+  payload = g_malloc0 (plen);
+  memcpy (payload + 0, &flags, 4);       /* host is LE */
+  memcpy (payload + 4, &wblen, 4);
+  memcpy (payload + 8, GD_PSK_WHITE_BOX, wblen);
+
+  reply = gd_exec (self, GD_CMD_PRESET_PSK_WRITE, payload, plen, &len, error);
+  if (!reply)
+    return FALSE;
+
+  if (len < 1 || reply[0] != 0x00)
+    {
+      g_set_error_literal (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                           "Failed to write PSK");
+      return FALSE;
+    }
+  return TRUE;
+}
+
+static gboolean
+gd_op_reset (FpiDeviceGoodix5xx *self, GError **error)
+{
+  g_autofree guint8 *reply = NULL;
+  gsize len = 0;
+  /* reset(reset_sensor=True, soft_reset_mcu=False, sleep_time=20) */
+  const guint8 payload[2] = { 0x05, 20 };
+
+  reply = gd_exec (self, GD_CMD_RESET, payload, sizeof (payload), &len, error);
+  if (!reply)
+    return FALSE;
+  if (len < 1 || reply[0] != 0x01)
+    {
+      g_set_error_literal (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                           "Reset failed");
+      return FALSE;
+    }
+  return TRUE;
+}
+
+static gboolean
+gd_op_read_sensor_register (FpiDeviceGoodix5xx *self, guint16 addr,
+                            guint8 length, GError **error)
+{
+  g_autofree guint8 *reply = NULL;
+  gsize len = 0;
+  guint8 payload[4] = { 0x00, addr & 0xff, (addr >> 8) & 0xff, length };
+
+  reply = gd_exec (self, GD_CMD_READ_SENSOR_REGISTER, payload,
+                   sizeof (payload), &len, error);
+  return reply != NULL;
+}
+
+static gboolean
+gd_op_read_otp (FpiDeviceGoodix5xx *self, GError **error)
+{
+  g_autofree guint8 *reply = NULL;
+  gsize len = 0;
+
+  reply = gd_exec (self, GD_CMD_READ_OTP, (const guint8 *) "\x00\x00", 2,
+                   &len, error);
+  return reply != NULL;
+}
+
+static gboolean
+gd_op_upload_config (FpiDeviceGoodix5xx *self, GError **error)
+{
+  g_autofree guint8 *reply = NULL;
+  gsize len = 0;
+
+  reply = gd_exec (self, GD_CMD_UPLOAD_CONFIG_MCU, GD_DEVICE_CONFIG,
+                   sizeof (GD_DEVICE_CONFIG), &len, error);
+  if (!reply)
+    return FALSE;
+  if (len < 1 || reply[0] != 0x01)
+    {
+      g_set_error_literal (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                           "Failed to upload config");
+      return FALSE;
+    }
+  return TRUE;
+}
+
+static gboolean
+gd_op_fdt_mode (FpiDeviceGoodix5xx *self, GError **error)
+{
+  g_autofree guint8 *reply = NULL;
+  gsize len = 0;
+
+  reply = gd_exec (self, GD_CMD_MCU_SWITCH_TO_FDT_MODE, GD_FDT_MODE,
+                   sizeof (GD_FDT_MODE), &len, error);
+  return reply != NULL;
+}
+
+static gboolean
+gd_op_fdt_down (FpiDeviceGoodix5xx *self, guint timeout, GError **error)
+{
+  const guint8 *payload;
+  guint8 flags;
+  gsize plen;
+
+  if (!gd_send_cmd (self, GD_CMD_MCU_SWITCH_TO_FDT_DOWN, GD_FDT_DOWN,
+                    sizeof (GD_FDT_DOWN), error))
+    return FALSE;
+  if (!gd_read_ack (self, GD_CMD_MCU_SWITCH_TO_FDT_DOWN, error))
+    return FALSE;
+
+  /* Reply only arrives once a finger is on the sensor. */
+  payload = gd_read_pack (self, timeout, &flags, &plen, error);
+  return payload != NULL;
+}
+
+/* Arm the finger-up detector and wait for the finger to be lifted.  Same shape
+ * as gd_op_fdt_down; the reply arrives once the finger leaves the sensor. */
+static gboolean
+gd_op_fdt_up (FpiDeviceGoodix5xx *self, guint timeout, GError **error)
+{
+  const guint8 *payload;
+  guint8 flags;
+  gsize plen;
+
+  if (!gd_send_cmd (self, GD_CMD_MCU_SWITCH_TO_FDT_UP, GD_FDT_UP,
+                    sizeof (GD_FDT_UP), error))
+    return FALSE;
+  if (!gd_read_ack (self, GD_CMD_MCU_SWITCH_TO_FDT_UP, error))
+    return FALSE;
+
+  payload = gd_read_pack (self, timeout, &flags, &plen, error);
+  return payload != NULL;
+}
+
+static gboolean
+gd_op_idle_mode (FpiDeviceGoodix5xx *self, guint8 sleep_time, GError **error)
+{
+  guint8 payload[2] = { sleep_time, 0x00 };
+
+  return gd_exec_ack_only (self, GD_CMD_MCU_SWITCH_TO_IDLE_MODE,
+                           payload, sizeof (payload), error);
+}
+
+static gboolean
+gd_op_switch_to_sleep (FpiDeviceGoodix5xx *self, guint8 number, GError **error)
+{
+  g_autofree guint8 *reply = NULL;
+  gsize len = 0;
+  guint8 payload[1] = { number };
+
+  reply = gd_exec (self, GD_CMD_SWITCH_TO_SLEEP_MODE, payload, 1, &len, error);
+  if (!reply)
+    return FALSE;
+  if (len < 1 || reply[0] != 0x01)
+    {
+      g_set_error_literal (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                           "Failed to switch to sleep mode");
+      return FALSE;
+    }
+  return TRUE;
+}
+
+/* mcu_get_image: trigger a capture and read the (TLS encrypted) image. */
+static gboolean
+gd_op_get_image (FpiDeviceGoodix5xx *self, guint8 *out, gsize out_len,
+                 GError **error)
+{
+  gsize got = 0;
+
+  if (!gd_send_cmd (self, GD_CMD_MCU_GET_IMAGE,
+                    (const guint8 *) "\x01\x00", 2, error))
+    return FALSE;
+  if (!gd_read_ack (self, GD_CMD_MCU_GET_IMAGE, error))
+    return FALSE;
+
+  while (got < out_len)
+    {
+      int ret = SSL_read (self->tls_ssl, out + got, out_len - got);
+      int err;
+
+      if (ret > 0)
+        {
+          got += ret;
+          continue;
+        }
+
+      err = SSL_get_error (self->tls_ssl, ret);
+      if (err == SSL_ERROR_WANT_READ)
+        {
+          if (!gd_tls_feed (self, error))
+            return FALSE;
+          continue;
+        }
+      if (err == SSL_ERROR_WANT_WRITE)
+        {
+          gd_tls_pump (self);
+          if (!gd_tls_flush (self, error))
+            return FALSE;
+          continue;
+        }
+      gd_tls_set_ossl_error (error, "TLS image read failed");
+      return FALSE;
+    }
+
+  if (got < out_len)
+    {
+      g_set_error (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                   "Short image: got %zu of %zu bytes", got, out_len);
+      return FALSE;
+    }
+  return TRUE;
+}
+
+/* Raw ADC value that means "ADC full scale" -- the sensor saturates here where
+ * no finger is in contact (goodix53x5 GOODIX_RAW12_CLIP). */
+#define GD_RAW12_CLIP 4095
+
+/* tool.decode_image: 6 packed bytes -> 4 twelve-bit pixels.  Keeps the full
+ * 12-bit precision (the reference driver normalises in 12-bit space; downshifting
+ * to 8 bits here would throw away ridge contrast before normalisation). */
+static void
+gd_decode_raw12 (const guint8 *data, gsize len, guint16 *out, guint npix)
+{
+  guint p = 0;
+  gsize i;
+
+  for (i = 0; i + 6 <= len && p + 4 <= npix; i += 6)
+    {
+      const guint8 *c = data + i;
+
+      out[p++] = ((c[0] & 0x0f) << 8) | c[1];
+      out[p++] = (c[3] << 4) | (c[0] >> 4);
+      out[p++] = ((c[5] & 0x0f) << 8) | c[2];
+      out[p++] = (c[4] << 4) | (c[5] >> 4);
+    }
+}
+
+static int
+gd_cmp_double (const void *a, const void *b)
+{
+  double l = *(const double *) a, r = *(const double *) b;
+
+  return (l > r) - (l < r);
+}
+
+/* Convert a 12-bit finger frame to an 8-bit image for SIGFM/SIFT, following the
+ * goodix53x5 reference (goodix_device_image_to_8bit).  This is deliberately
+ * *light*: subtract the no-finger calibration frame, then normalise the interior
+ * with a robust 3%..97% percentile stretch -- SIGFM's own CLAHE does the local
+ * contrast enhancement afterwards.  Applying an extra high-pass here (as an
+ * earlier version did) only turns sensor noise into non-repeatable SIFT
+ * keypoints that never match across presses.
+ *
+ * Crucially, pixels at ADC full scale (GD_RAW12_CLIP) are non-contact areas:
+ * the finger is not touching there, so they carry no ridge signal and their
+ * fixed pattern is destroyed by the clip.  They are excluded from the
+ * normalisation sample and painted flat white, so SIFT finds no keypoints in
+ * the empty regions -- only on the actual contact patch. */
+static void
+gd_image_to_8bit (const guint16 *img12, const guint16 *calib, guint8 *out)
+{
+  const int w = GD_IMAGE_WIDTH, h = GD_IMAGE_HEIGHT, n = GD_IMAGE_PIXELS;
+  double *corrected = g_malloc (n * sizeof (double));
+  double *sample = g_malloc ((w - 2) * (h - 2) * sizeof (double));
+  int sample_count = 0;
+  double lo, hi, white, range;
+  int i, r, c;
+
+  for (i = 0; i < n; i++)
+    corrected[i] = calib ? (double) img12[i] - calib[i] : img12[i];
+
+  /* Sample only the interior, in-contact pixels for the percentile range. */
+  for (r = 1; r < h - 1; r++)
+    for (c = 1; c < w - 1; c++)
+      if (img12[r * w + c] < GD_RAW12_CLIP)
+        sample[sample_count++] = corrected[r * w + c];
+
+  if (sample_count == 0)
+    {
+      /* No contact anywhere: flat white, no keypoints. */
+      memset (out, 255, n);
+      g_free (corrected);
+      g_free (sample);
+      return;
+    }
+
+  qsort (sample, sample_count, sizeof (double), gd_cmp_double);
+  lo    = sample[(int) (0.03 * (sample_count - 1))];
+  hi    = sample[(int) (0.97 * (sample_count - 1))];
+  white = sample[(int) (0.99 * (sample_count - 1))];
+
+  /* Non-contact pixels map above the ceiling -> flat white. */
+  for (i = 0; i < n; i++)
+    if (img12[i] >= GD_RAW12_CLIP)
+      corrected[i] = white;
+
+  range = hi - lo;
+  if (range < 1.0)
+    range = 1.0;
+
+  for (i = 0; i < n; i++)
+    out[i] = (guint8) CLAMP ((int) (((corrected[i] - lo) * 255.0) / range), 0, 255);
+
+  g_free (corrected);
+  g_free (sample);
+}
+
+/* Decode + process one raw frame into a freshly allocated GD_IMAGE_PIXELS
+ * 8-bit buffer (the input to SIGFM/SIFT). */
+static guint8 *
+gd_decode_processed (FpiDeviceGoodix5xx *self, const guint8 *data, gsize len)
+{
+  g_autofree guint16 *img12 = g_malloc0 (GD_IMAGE_PIXELS * sizeof (guint16));
+  guint8 *px = g_malloc0 (GD_IMAGE_PIXELS);
+
+  gd_decode_raw12 (data, len, img12, GD_IMAGE_PIXELS);
+  gd_image_to_8bit (img12, self->bg, px);
+  return px;
+}
+
+/* ================================================================== *
+ *  Worker thread: full activation + capture
+ * ================================================================== */
+
+/* One marshalled call from the worker thread to the main loop. */
+typedef struct
+{
+  FpiDeviceGoodix5xx *self;
+  GoodixMatchInfo    *probe;      /* extracted SIGFM features (owned), or NULL */
+  int                 keypoints;
+  GError             *error;      /* owned, for the error/finish paths */
+  guint               gen;        /* action generation this call belongs to */
+} GdCall;
+
+/* Release the worker from its per-frame wait with the given decision. */
+static void
+gd_resume (FpiDeviceGoodix5xx *self, GdResume r)
+{
+  g_mutex_lock (&self->step_mutex);
+  self->step_resume = r;
+  g_cond_signal (&self->step_cond);
+  g_mutex_unlock (&self->step_mutex);
+}
+
+static void
+gd_marshal (FpiDeviceGoodix5xx *self, guint gen, GSourceFunc fn,
+            GoodixMatchInfo *probe, int keypoints, GError *err)
+{
+  GdCall *c = g_new0 (GdCall, 1);
+
+  c->self = g_object_ref (self);
+  c->probe = probe;
+  c->keypoints = keypoints;
+  c->error = err;
+  c->gen = gen;
+  g_idle_add (fn, c);
+}
+
+/* TRUE if this marshalled call belongs to a superseded action (a worker that
+ * has since been reaped); such calls must not touch the current action. */
+static gboolean
+gd_call_is_stale (GdCall *c)
+{
+  return c->gen != c->self->generation;
+}
+
+/* Complete whatever action is in progress with @error (transfers ownership). */
+static void
+gd_complete_action (FpDevice *dev, GError *error)
+{
+  FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
+
+  if (self->action_completed)
+    {
+      g_clear_error (&error);
+      return;
+    }
+  self->action_completed = TRUE;
+
+  switch (self->action)
+    {
+    case GD_ACT_ENROLL:
+      g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
+      fpi_device_enroll_complete (dev, NULL, error);
+      break;
+    case GD_ACT_VERIFY:
+      fpi_device_verify_complete (dev, error);
+      break;
+    case GD_ACT_IDENTIFY:
+      fpi_device_identify_complete (dev, error);
+      break;
+    }
+}
+
+/* Best SIGFM score of @probe against all serialized samples of @print. */
+static int
+gd_best_score (GoodixMatchInfo *probe, FpPrint *print)
+{
+  g_autoptr(GVariant) data = NULL;
+  GVariantIter iter;
+  GVariant *child;
+  int best = 0;
+
+  g_object_get (G_OBJECT (print), "fpi-data", &data, NULL);
+  if (data == NULL || !g_variant_is_of_type (data, G_VARIANT_TYPE ("aay")))
+    return 0;
+
+  g_variant_iter_init (&iter, data);
+  while ((child = g_variant_iter_next_value (&iter)))
+    {
+      gsize len;
+      const guint8 *feature = g_variant_get_fixed_array (child, &len, 1);
+
+      if (len > 0)
+        {
+          int score = 0;
+
+          if (goodix_match_serialized_feature (probe, feature, len, &score)
+              == GOODIX_SIGFM_TEMPLATE_OK && score > best)
+            best = score;
+        }
+      g_variant_unref (child);
+    }
+  return best;
+}
+
+/* Main-thread: an error from the worker. */
+static gboolean
+gd_idle_error (gpointer data)
+{
+  GdCall *c = data;
+
+  if (!gd_call_is_stale (c))
+    gd_complete_action (FP_DEVICE (c->self), g_steal_pointer (&c->error));
+  g_clear_error (&c->error);
+  g_object_unref (c->self);
+  g_free (c);
+  return G_SOURCE_REMOVE;
+}
+
+/* Main-thread: the worker's loop ended.  If nothing completed the action yet
+ * (i.e. it was cancelled), complete it now with a cancelled error. */
+static gboolean
+gd_idle_finish (gpointer data)
+{
+  GdCall *c = data;
+
+  if (!gd_call_is_stale (c) && !c->self->action_completed)
+    gd_complete_action (FP_DEVICE (c->self),
+                        g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                                             "Operation cancelled"));
+  g_object_unref (c->self);
+  g_free (c);
+  return G_SOURCE_REMOVE;
+}
+
+/* Main-thread: build and store the enrolled print from the collected samples. */
+static void
+gd_finish_enroll (FpDevice *dev)
+{
+  FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
+  GVariantBuilder builder;
+  FpPrint *print = NULL;
+  GVariant *fpdata;
+  guint i;
+
+  fpi_device_get_enroll_data (dev, &print);
+  fpi_print_set_type (print, FPI_PRINT_RAW);
+
+  g_variant_builder_init (&builder, G_VARIANT_TYPE ("aay"));
+  for (i = 0; i < self->enroll_features->len; i++)
+    {
+      GBytes *feature = g_ptr_array_index (self->enroll_features, i);
+      gsize len;
+      const guint8 *bytes = g_bytes_get_data (feature, &len);
+
+      g_variant_builder_add (&builder, "@ay",
+                             g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
+                                                        bytes, len, 1));
+    }
+  fpdata = g_variant_builder_end (&builder);
+  g_object_set (G_OBJECT (print), "fpi-data", fpdata, NULL);
+
+  g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
+
+  self->action_completed = TRUE;
+  fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+}
+
+/* Main-thread: process one captured frame according to the current action.
+ * Consumes c->probe.  Ends by resuming the worker (CONTINUE or STOP). */
+static gboolean
+gd_idle_frame (gpointer data)
+{
+  GdCall *c = data;
+  FpiDeviceGoodix5xx *self = c->self;
+  FpDevice *dev = FP_DEVICE (self);
+  GoodixMatchInfo *probe = c->probe;
+
+  /* A frame from a superseded action (reaped worker): drop it silently. */
+  if (gd_call_is_stale (c))
+    goto out;
+
+  /* Too few keypoints: ask for a re-scan (do not count this frame). */
+  if (c->keypoints < GD_MIN_CAPTURE_KEYPOINTS)
+    {
+      fp_dbg ("capture rejected: %d keypoints (< %d)",
+              c->keypoints, GD_MIN_CAPTURE_KEYPOINTS);
+      if (self->action == GD_ACT_ENROLL)
+        {
+          fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
+                                      fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
+          gd_resume (self, GD_RESUME_CONTINUE);
+        }
+      else if (self->action == GD_ACT_VERIFY)
+        {
+          fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL,
+                                    fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
+          gd_complete_action (dev, NULL);
+          gd_resume (self, GD_RESUME_STOP);
+        }
+      else
+        {
+          fpi_device_identify_report (dev, NULL, NULL,
+                                      fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
+          gd_complete_action (dev, NULL);
+          gd_resume (self, GD_RESUME_STOP);
+        }
+      goto out;
+    }
+
+  switch (self->action)
+    {
+    case GD_ACT_ENROLL:
+      {
+        GBytes *feature = goodix_match_serialize_template (probe);
+
+        if (feature == NULL)
+          {
+            gd_complete_action (dev,
+                                fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                                          "Failed to serialize SIGFM features"));
+            gd_resume (self, GD_RESUME_STOP);
+            break;
+          }
+
+        g_ptr_array_add (self->enroll_features, feature);
+        self->enroll_stage++;
+        fp_dbg ("enroll stage %d/%d", self->enroll_stage, GD_ENROLL_SAMPLES);
+        fpi_device_enroll_progress (dev, self->enroll_stage, NULL, NULL);
+
+        if (self->enroll_stage >= GD_ENROLL_SAMPLES)
+          {
+            gd_finish_enroll (dev);
+            gd_resume (self, GD_RESUME_STOP);
+          }
+        else
+          {
+            gd_resume (self, GD_RESUME_CONTINUE);
+          }
+      }
+      break;
+
+    case GD_ACT_VERIFY:
+      {
+        FpPrint *enrolled = NULL;
+        int best;
+
+        fpi_device_get_verify_data (dev, &enrolled);
+        best = gd_best_score (probe, enrolled);
+        fp_dbg ("verify best SIGFM score %d (min %d)", best, GD_SIGFM_BEST_MIN);
+
+        fpi_device_verify_report (dev,
+                                  best >= GD_SIGFM_BEST_MIN ? FPI_MATCH_SUCCESS
+                                                            : FPI_MATCH_FAIL,
+                                  NULL, NULL);
+        gd_complete_action (dev, NULL);
+        gd_resume (self, GD_RESUME_STOP);
+      }
+      break;
+
+    case GD_ACT_IDENTIFY:
+      {
+        GPtrArray *gallery = NULL;
+        FpPrint *match = NULL;
+        int best_match = 0;
+        guint i;
+
+        fpi_device_get_identify_data (dev, &gallery);
+        for (i = 0; gallery && i < gallery->len; i++)
+          {
+            FpPrint *tmpl = g_ptr_array_index (gallery, i);
+            int s = gd_best_score (probe, tmpl);
+
+            if (s >= GD_SIGFM_BEST_MIN && s > best_match)
+              {
+                best_match = s;
+                match = tmpl;
+              }
+          }
+        fp_dbg ("identify best SIGFM score %d (min %d)", best_match, GD_SIGFM_BEST_MIN);
+
+        fpi_device_identify_report (dev, match, NULL, NULL);
+        gd_complete_action (dev, NULL);
+        gd_resume (self, GD_RESUME_STOP);
+      }
+      break;
+    }
+
+out:
+  goodix_match_free_info (probe);
+  g_object_unref (c->self);
+  g_free (c);
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+gd_full_init (FpiDeviceGoodix5xx *self, GError **error)
+{
+  g_autofree gchar *fw = NULL;
+  gboolean psk_valid = FALSE;
+
+  /* goodix.py Device.__init__: empty_buffer() then nop().  Drain again after
+   * the NOP so its (checksum-less) ACK cannot desync the next exchange. */
+  gd_drain (self);
+  gd_op_nop (self, NULL);
+  gd_drain (self);
+
+  if (!gd_op_firmware_version (self, &fw, error))
+    return FALSE;
+  fp_dbg ("Firmware: %s", fw);
+
+  /* We only drive the application firmware; flashing/IAP is handled by the
+   * goodix-fp-dump python tool. */
+  if (!g_str_has_prefix (fw, "GF32") || !strstr (fw, "_RTSEC_APP_"))
+    {
+      g_set_error (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_NOT_SUPPORTED,
+                   "Unexpected firmware '%s'; flash the app firmware with "
+                   "goodix-fp-dump first", fw);
+      return FALSE;
+    }
+
+  if (!gd_op_check_psk (self, &psk_valid, error))
+    return FALSE;
+  if (!psk_valid)
+    {
+      fp_dbg ("PSK not set, writing whitebox PSK");
+      if (!gd_op_write_psk (self, error))
+        return FALSE;
+      /* write_psk() re-reads the PSK to confirm it took. */
+      if (!gd_op_check_psk (self, &psk_valid, error))
+        return FALSE;
+      if (!psk_valid)
+        {
+          g_set_error_literal (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_IO,
+                               "PSK verification failed after write");
+          return FALSE;
+        }
+    }
+
+  fp_dbg ("init: reset");
+  if (!gd_op_reset (self, error))
+    return FALSE;
+  fp_dbg ("init: read chip id");
+  if (!gd_op_read_sensor_register (self, 0x0000, 4, error))   /* chip id */
+    return FALSE;
+  fp_dbg ("init: read otp");
+  if (!gd_op_read_otp (self, error))
+    return FALSE;
+
+  fp_dbg ("init: TLS handshake");
+  if (!gd_tls_handshake (self, error))
+    return FALSE;
+
+  fp_dbg ("init: upload config");
+  if (!gd_op_upload_config (self, error))
+    return FALSE;
+
+  /* Sensor calibration, matching driver_55x4.py run_driver(): capture and
+   * discard two background ("clear") frames, then put the MCU to sleep so the
+   * finger-down detector can arm. */
+  {
+    g_autofree guint8 *clear = g_malloc0 (GD_IMAGE_BYTES);
+
+    fp_dbg ("init: fdt mode + clear frame 0");
+    if (!gd_op_fdt_mode (self, error))
+      return FALSE;
+    if (!gd_op_get_image (self, clear, GD_IMAGE_BYTES, error))     /* clear-0 */
+      return FALSE;
+
+    fp_dbg ("init: fdt mode + idle + clear frame 1");
+    if (!gd_op_fdt_mode (self, error))
+      return FALSE;
+    if (!gd_op_idle_mode (self, 20, error))
+      return FALSE;
+    if (!gd_op_read_sensor_register (self, 0x0082, 2, error))
+      return FALSE;
+    if (!gd_op_get_image (self, clear, GD_IMAGE_BYTES, error))     /* clear-1 */
+      return FALSE;
+
+    /* Keep clear-1 (finger-off) as the 12-bit calibration frame; it is
+     * subtracted from every finger frame in gd_image_to_8bit() to cancel the
+     * sensor's fixed background pattern. */
+    if (!self->bg)
+      self->bg = g_malloc0 (GD_IMAGE_PIXELS * sizeof (guint16));
+    gd_decode_raw12 (clear, GD_IMAGE_BYTES - 4, self->bg, GD_IMAGE_PIXELS);
+
+    fp_dbg ("init: fdt mode + sleep");
+    if (!gd_op_fdt_mode (self, error))
+      return FALSE;
+    if (!gd_op_switch_to_sleep (self, 0x6c, error))
+      return FALSE;
+  }
+  fp_dbg ("init: done");
+
+  return TRUE;
+}
+
+/* Poll the finger-down (or finger-up) detector until it fires or the worker is
+ * asked to stop.  Returns TRUE on the finger event, FALSE if stopping (*error
+ * NULL) or on a hard error (*error set). */
+static gboolean
+gd_wait_finger (FpiDeviceGoodix5xx *self, gboolean down, GError **error)
+{
+  while (!g_atomic_int_get (&self->stopping))
+    {
+      GError *err = NULL;
+      gboolean got = down ? gd_op_fdt_down (self, GD_FINGER_POLL_TIMEOUT, &err)
+                          : gd_op_fdt_up (self, GD_FINGER_POLL_TIMEOUT, &err);
+
+      if (got)
+        return TRUE;
+      if (err &&
+          !g_error_matches (err, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
+        {
+          g_propagate_error (error, err);
+          return FALSE;
+        }
+      g_clear_error (&err);
+    }
+  return FALSE;
+}
+
+/* Block until the main thread has processed the last frame, returning its
+ * decision (CONTINUE / STOP).  STOP also on stop request. */
+static GdResume
+gd_wait_resume (FpiDeviceGoodix5xx *self)
+{
+  GdResume r;
+
+  g_mutex_lock (&self->step_mutex);
+  while (self->step_resume == GD_RESUME_NONE &&
+         !g_atomic_int_get (&self->stopping))
+    g_cond_wait (&self->step_cond, &self->step_mutex);
+  r = self->step_resume;
+  g_mutex_unlock (&self->step_mutex);
+
+  if (g_atomic_int_get (&self->stopping))
+    return GD_RESUME_STOP;
+  return r;
+}
+
+static gpointer
+gd_worker (gpointer data)
+{
+  FpiDeviceGoodix5xx *self = data;
+  GError *error = NULL;
+  guint gen = self->generation;   /* fixed for this worker's lifetime */
+
+  /* The sensor needs the full init sequence (reset, TLS, config, and the
+   * fdt-mode/clear-frame/sleep calibration dance) before each capture batch to
+   * produce consistently exposed images; skipping it makes captures from
+   * different sessions incomparable.  So re-init every action. */
+  if (!gd_full_init (self, &error))
+    goto err;
+
+  /* Capture loop.  Enroll collects GD_ENROLL_SAMPLES good frames; verify and
+   * identify capture a single frame.  The main thread decides after each frame
+   * whether to continue (via the step gate), so the worker never starts a new
+   * capture after the action has completed. */
+  while (!g_atomic_int_get (&self->stopping))
+    {
+      guint8 *raw;
+      guint8 *px;
+      GoodixMatchInfo *probe;
+      int keypoints;
+
+      if (!gd_wait_finger (self, TRUE, &error))
+        {
+          if (error)
+            goto err;
+          break;                    /* stop requested */
+        }
+
+      raw = g_malloc0 (GD_IMAGE_BYTES);
+      if (!gd_op_get_image (self, raw, GD_IMAGE_BYTES, &error))
+        {
+          g_free (raw);
+          goto err;
+        }
+      /* Drop the trailing 4 bytes (tool.decode_image uses data[:-4]). */
+      px = gd_decode_processed (self, raw, GD_IMAGE_BYTES - 4);
+      g_free (raw);
+
+      probe = goodix_match_extract (px, GD_IMAGE_WIDTH, GD_IMAGE_HEIGHT);
+      keypoints = goodix_match_keypoints_count (probe);
+      g_free (px);
+
+      /* Wait for the finger to physically lift *before* reporting the result.
+       * This makes every enroll stage a fresh press, and -- crucially -- keeps
+       * the sensor clear when the next action runs: fprintd does not start the
+       * next action (its pre-enroll duplicate check, the enroll itself, or a
+       * verify) until we report, so by then the finger is up and that action's
+       * calibration frames capture the true background instead of a lingering
+       * finger, which would otherwise poison every template built against it.
+       * It also avoids a deadlock: reporting only after the lift means the
+       * worker is never inside a finger-up USB transfer when the next action's
+       * join runs. */
+      if (!gd_wait_finger (self, FALSE, &error))
+        {
+          goodix_match_free_info (probe);
+          if (error)
+            goto err;
+          break;                    /* stop requested */
+        }
+
+      /* Hand the frame to the main thread and wait for its decision. */
+      gd_resume (self, GD_RESUME_NONE);   /* arm the gate before marshalling */
+      gd_marshal (self, gen, gd_idle_frame, probe, keypoints, NULL);
+
+      if (gd_wait_resume (self) == GD_RESUME_STOP)
+        break;
+    }
+
+  gd_marshal (self, gen, gd_idle_finish, NULL, 0, NULL);
+  goto done;
+
+err:
+  /* Drop the (possibly broken) TLS session so the next action starts clean. */
+  gd_tls_deinit (self);
+
+  /* libfprint discards (and replaces with a generic message) any error that is
+   * not in the FpDeviceError / FpDeviceRetry domain, which would hide the real
+   * cause.  Re-wrap while preserving the original message. */
+  if (error &&
+      error->domain != FP_DEVICE_ERROR && error->domain != FP_DEVICE_RETRY)
+    {
+      GError *wrapped = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                  "%s", error->message);
+      g_error_free (error);
+      error = wrapped;
+    }
+  gd_marshal (self, gen, gd_idle_error, NULL, 0, error);
+
+done:
+  /* Publish that the worker has finished, then wake the main context so a
+   * gd_reap_worker() pumping it observes worker_done and stops iterating. */
+  g_atomic_int_set (&self->worker_done, TRUE);
+  g_main_context_wakeup (NULL);
+  return NULL;
+}
+
+/* ================================================================== *
+ *  FpImageDevice vfuncs
+ * ================================================================== */
+
+/* Find the interface exposing bulk IN/OUT endpoints, as protocol.py does at
+ * connect time.  We prefer a data/vendor-class interface but fall back to any
+ * interface that has a bulk IN + bulk OUT pair.  Everything enumerated is
+ * logged so a mismatch is diagnosable from the debug output. */
+static gboolean
+gd_discover_endpoints (FpiDeviceGoodix5xx *self, GError **error)
+{
+  g_autoptr(GPtrArray) ifaces = NULL;
+  guint i, j;
+  gboolean found = FALSE;
+  gboolean found_preferred = FALSE;
+
+  ifaces = g_usb_device_get_interfaces (self->usb, error);
+  if (!ifaces)
+    return FALSE;
+
+  fp_dbg ("Enumerating %u interface(s)", ifaces->len);
+
+  for (i = 0; i < ifaces->len; i++)
+    {
+      GUsbInterface *iface = g_ptr_array_index (ifaces, i);
+      guint8 cls = g_usb_interface_get_class (iface);
+      guint8 num = g_usb_interface_get_number (iface);
+      gboolean preferred = (cls == GD_USB_CLASS_CDC_DATA ||
+                            cls == GD_USB_CLASS_VENDOR);
+      GPtrArray *eps;
+      guint8 ep_in = 0, ep_out = 0;
+
+      eps = g_usb_interface_get_endpoints (iface);
+      fp_dbg ("  iface #%u class 0x%02x subclass 0x%02x proto 0x%02x, %u endpoint(s)",
+              num, cls, g_usb_interface_get_subclass (iface),
+              g_usb_interface_get_protocol (iface), eps ? eps->len : 0);
+
+      for (j = 0; eps && j < eps->len; j++)
+        {
+          GUsbEndpoint *ep = g_ptr_array_index (eps, j);
+          guint8 addr = g_usb_endpoint_get_address (ep);
+          gboolean is_in = (g_usb_endpoint_get_direction (ep) ==
+                            G_USB_DEVICE_DIRECTION_DEVICE_TO_HOST);
+
+          fp_dbg ("    ep 0x%02x dir %s", addr, is_in ? "IN" : "OUT");
+
+          /* gusb does not expose the transfer type (get_kind returns the
+           * descriptor type, always 0x05), so we select purely by direction;
+           * the goodix data interface carries exactly one bulk IN and one
+           * bulk OUT endpoint. */
+          if (is_in)
+            ep_in = addr;
+          else
+            ep_out = addr;
+        }
+
+      if (!ep_in || !ep_out)
+        continue;
+
+      /* Take the first match; upgrade to a preferred-class one if we find it. */
+      if (!found || (preferred && !found_preferred))
+        {
+          self->iface = num;
+          self->ep_in = ep_in;
+          self->ep_out = ep_out;
+          found = TRUE;
+          found_preferred = preferred;
+        }
+    }
+
+  if (!found)
+    {
+      g_set_error_literal (error, G_USB_DEVICE_ERROR,
+                           G_USB_DEVICE_ERROR_NO_DEVICE,
+                           "No interface with bulk IN+OUT endpoints found");
+      return FALSE;
+    }
+
+  fp_dbg ("Using interface %u, bulk IN 0x%02x, bulk OUT 0x%02x",
+          self->iface, self->ep_in, self->ep_out);
+  return TRUE;
+}
+
+/* Signal any running worker to stop and reap it.
+ *
+ * The worker may be blocked in a synchronous g_usb_device_bulk_transfer() whose
+ * completion is dispatched from *this* (main) GMainContext, so a plain
+ * g_thread_join() here would deadlock -- the transfer could never complete
+ * because the loop that would complete it is blocked in the join.  Instead,
+ * iterate the main context until the worker signals it is done (letting its
+ * in-flight transfer complete or time out and the worker observe `stopping`),
+ * then join, which is now immediate.  In the common case the worker has already
+ * finished (it reports only after the finger lifts, past all USB), so the loop
+ * body never runs. */
+static void
+gd_reap_worker (FpiDeviceGoodix5xx *self)
+{
+  if (!self->worker)
+    return;
+  g_atomic_int_set (&self->stopping, TRUE);
+  gd_resume (self, GD_RESUME_STOP);
+  while (!g_atomic_int_get (&self->worker_done))
+    g_main_context_iteration (NULL, TRUE);
+  g_thread_join (self->worker);
+  self->worker = NULL;
+}
+
+static void
+dev_open (FpDevice *dev)
+{
+  FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
+  GError *error = NULL;
+
+  self->usb = fpi_device_get_usb_device (dev);
+  self->read_buf = g_malloc0 (GD_READ_BUF_SIZE);
+  g_mutex_init (&self->step_mutex);
+  g_cond_init (&self->step_cond);
+
+  if (!gd_discover_endpoints (self, &error))
+    {
+      fpi_device_open_complete (dev, error);
+      return;
+    }
+
+  if (!g_usb_device_claim_interface (self->usb, self->iface, 0, &error))
+    {
+      fpi_device_open_complete (dev, error);
+      return;
+    }
+
+  fpi_device_open_complete (dev, NULL);
+}
+
+static void
+dev_close (FpDevice *dev)
+{
+  FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
+  GError *error = NULL;
+
+  /* Supersede the worker's generation before reaping so that any completion it
+   * marshals while gd_reap_worker() pumps the context is ignored rather than
+   * completing an action on a device that is closing. */
+  self->generation++;
+  gd_reap_worker (self);
+
+  gd_tls_deinit (self);
+  g_clear_pointer (&self->read_buf, g_free);
+  g_clear_pointer (&self->bg, g_free);
+  g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
+  g_mutex_clear (&self->step_mutex);
+  g_cond_clear (&self->step_cond);
+
+  g_usb_device_release_interface (self->usb, self->iface, 0, &error);
+
+  fpi_device_close_complete (dev, error);
+}
+
+/* Start the worker for @action (enroll / verify / identify). */
+static void
+gd_start_action (FpDevice *dev, GdAction action)
+{
+  FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
+
+  /* New action generation, bumped *before* reaping so that any idle marshals
+   * the old worker emits while gd_reap_worker() pumps the main context belong
+   * to a superseded generation and are ignored (they must not touch this new
+   * action). */
+  self->generation++;
+  gd_reap_worker (self);
+
+  self->action_completed = FALSE;
+  self->action = action;
+  self->step_resume = GD_RESUME_NONE;
+  g_atomic_int_set (&self->stopping, FALSE);
+  g_atomic_int_set (&self->worker_done, FALSE);
+
+  if (action == GD_ACT_ENROLL)
+    {
+      self->enroll_stage = 0;
+      g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
+      self->enroll_features =
+        g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
+    }
+
+  self->worker = g_thread_new ("goodix5xx-worker", gd_worker, self);
+}
+
+static void
+dev_enroll (FpDevice *dev)
+{
+  gd_start_action (dev, GD_ACT_ENROLL);
+}
+
+static void
+dev_verify (FpDevice *dev)
+{
+  gd_start_action (dev, GD_ACT_VERIFY);
+}
+
+static void
+dev_identify (FpDevice *dev)
+{
+  gd_start_action (dev, GD_ACT_IDENTIFY);
+}
+
+static void
+dev_cancel (FpDevice *dev)
+{
+  FpiDeviceGoodix5xx *self = FPI_DEVICE_GOODIX5XX (dev);
+
+  /* Ask the worker to stop; it completes the action with a cancelled error
+   * from its finish marshal (see gd_idle_finish). */
+  g_atomic_int_set (&self->stopping, TRUE);
+  gd_resume (self, GD_RESUME_STOP);
+}
+
+static const FpIdEntry id_table[] = {
+  { .vid = 0x27c6, .pid = 0x55a4, },
+  { .vid = 0, .pid = 0, .driver_data = 0 },
+};
+
+static void
+fpi_device_goodix5xx_init (FpiDeviceGoodix5xx *self)
+{
+}
+
+static void
+fpi_device_goodix5xx_class_init (FpiDeviceGoodix5xxClass *klass)
+{
+  FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
+
+  dev_class->id = "goodix5xx";
+  dev_class->full_name = "Goodix 55x4 Fingerprint Sensor";
+  dev_class->type = FP_DEVICE_TYPE_USB;
+  dev_class->id_table = id_table;
+  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+  dev_class->nr_enroll_stages = GD_ENROLL_SAMPLES;
+  dev_class->temp_hot_seconds = -1;    /* small sensor: no thermal throttling */
+  dev_class->features = FP_DEVICE_FEATURE_VERIFY | FP_DEVICE_FEATURE_IDENTIFY;
+
+  dev_class->open = dev_open;
+  dev_class->close = dev_close;
+  dev_class->enroll = dev_enroll;
+  dev_class->verify = dev_verify;
+  dev_class->identify = dev_identify;
+  dev_class->cancel = dev_cancel;
+}

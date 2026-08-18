@@ -1,6 +1,65 @@
 This file lists notable changes in each release. For the full history of all
 changes, see ChangeLog.
 
+2025-02-20: v1.94.9 release
+
+Highlights:
+  * uru4000: Use OpenSSL to perform AES-ECB encryption, as per this libfprint
+    does not support on NSS, but on openssl (>= 3.0).
+  * goodixmoc: New PIDs 0x60C2, 0x689A
+  * synaptics: New PIDs 0x016C, 0x0174, 0x0107, 0x0108, 0x00C2, 0x00F0
+  * fpcmoc: New PID 0xC844
+  * focaltech_moc: New PIDs 0xA99A, 0xA57A, 0xA78A
+  * elanmoc: New PIDs 0x0C98, 0x0C9D, 0x0CA3
+  * elanspi: New PIDs 0x3128, 0x2766
+  * fp-device: Add FP_DEVICE_RETRY_TOO_FAST retry error
+  * data: AppStream meta info listing supported USB devices.
+  * fixed various memory issues in multiple devices
+
+2024-09-03: v1.94.8 release
+
+Highlights:
+ * build: Support building in non-linux unix environments (tested in FreeBSD)
+ * egismoc: New PIDs 0x0583, 0x0586, 0x0587.
+ * elanmoc: New PID 0x0C9F.
+ * fpcmoc: New PIDs 0x9524, 0x9544.
+ * goodixmoc: New PIDs 0x609A, 0x650A, 0x650C, 0x6512.
+ * realtek: New PID 0x5816.
+ * synaptics: New PIDs 0x00C4, 0x019D, 0x00C6.
+ * fpcmoc: fix incorrect immobile handling during enrollment.
+ * fpcmoc: fixed jumping to wrong state at end of custom enroll.
+ * egismoc: various code cleanups.
+
+2024-02-20: v1.94.7 release
+
+Highlights:
+ * synaptics: fix enroll identify problem after user reset database.
+ * synaptics: New PIDs 0x0173, 0x0106, 0x0124.
+ * goodixmoc: New PID 0x6582.
+ * build: Do not require bash to build, only posix sh.
+ * fp-image: Simplify minutiae detection tasks.
+ * GLib 2.68 is now required to build libfprint.
+
+New drivers:
+ * realtek (PID 0x5813).
+ * focaltech_moc (PIDs 0x9E48, 0xD979, 0xA959).
+ * egismoc (PIDs 0x0582, 0x05a1).
+
+2023-08-17: v1.94.6 release
+
+Highlights:
+ * goodixmoc: New PIDs 0x60A4, 0x60BC, 0x6092, 0x633C and 0x6304.
+ * goodixmoc: Fix missing "enroll create" state.
+ * elanmoc: New PID 0x0C99.
+ * upektc: Improve compatibility with sensors 147e:2016.
+ * aes4000: Actually support 08FF:5501 devices.
+ * virtual-device-listener: Fix failing tests with GLib 2.76
+ * tests: Add installed tests
+
+Bugs fixed:
+ * #526 libfprint: fpcmoc: use after free if enrollment or identification is
+   cancelled (Vasily Khoruzhick)
+
 2022-10-13: v1.94.5 release
 
 Highlights:
@@ -342,7 +401,7 @@ tests of the drivers using umockdev.
   - Mark fp_dscv_print functions as deprecated
 
 * Udev rules:
-  - Add some unsupported devices to the whitelist
+  - Add some unsupported devices to the allowlist
 
 2017-05-14: v0.7.0 release
 * Drivers:
@@ -392,7 +451,7 @@ tests of the drivers using umockdev.
   - Fix possible race condition, and cancellation in uru4000 driver
 
 * Udev rules:
-  - Add Microsoft keyboard to the suspend blacklist
+  - Add Microsoft keyboard to the suspend denylist
 
 * Plenty of build fixes
 

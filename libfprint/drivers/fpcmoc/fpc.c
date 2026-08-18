@@ -21,7 +21,7 @@
 
 #define FP_COMPONENT "fpcmoc"
 #define MAX_ENROLL_SAMPLES (25)
-#define CTRL_TIMEOUT (1000)
+#define CTRL_TIMEOUT (2000)
 #define DATA_TIMEOUT (5000)
 
 /* Usb port setting */
@@ -68,6 +68,9 @@ static const FpIdEntry id_table[] = {
   { .vid = 0x10A5,  .pid = 0xDA04,  },
   { .vid = 0x10A5,  .pid = 0xD805,  },
   { .vid = 0x10A5,  .pid = 0xD205,  },
+  { .vid = 0x10A5,  .pid = 0x9524,  },
+  { .vid = 0x10A5,  .pid = 0x9544,  },
+  { .vid = 0x10A5,  .pid = 0xC844,  },
   /* terminating entry */
   { .vid = 0,  .pid = 0,  .driver_data = 0 },
 };
@@ -132,7 +135,11 @@ fpc_cmd_receive_cb (FpiUsbTransfer *transfer,
     }
 
   ssm_state = fpi_ssm_get_cur_state (transfer->ssm);
-  fp_dbg ("%s current ssm state: %d", G_STRFUNC, ssm_state);
+  fp_dbg ("%s current ssm request: %d state: %d", G_STRFUNC, data->request, ssm_state);
+
+  /* clean cmd_ssm except capture command for suspend/resume case */
+  if (ssm_state != FP_CMD_SEND || data->request != FPC_CMD_ARM)
+    self->cmd_ssm = NULL;
 
   if (data->cmdtype == FPC_CMDTYPE_TO_DEVICE)
     {
@@ -265,6 +272,7 @@ fpc_cmd_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
   FpiDeviceFpcMoc *self = FPI_DEVICE_FPCMOC (dev);
   CommandData *data = fpi_ssm_get_data (ssm);
 
+  self->cmd_ssm = NULL;
   /* Notify about the SSM failure from here instead. */
   if (error)
     {
@@ -272,8 +280,6 @@ fpc_cmd_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
       if (data->callback)
         data->callback (self, NULL, error);
     }
-
-  self->cmd_ssm = NULL;
 }
 
 static void
@@ -358,6 +364,7 @@ fpc_sensor_cmd (FpiDeviceFpcMoc *self,
       g_clear_object (&self->interrupt_cancellable);
     }
 
+  g_assert (self->cmd_ssm == NULL);
   self->cmd_ssm = fpi_ssm_new (FP_DEVICE (self),
                                fpc_cmd_run_state,
                                FP_CMD_NUM_STATES);
@@ -383,7 +390,7 @@ fpc_dev_release_interface (FpiDeviceFpcMoc *self,
     }
 
   /* Notify close complete */
-  fpi_device_close_complete (FP_DEVICE (self), release_error);
+  fpi_device_close_complete (FP_DEVICE (self), g_steal_pointer (&release_error));
 }
 
 static gboolean
@@ -441,10 +448,16 @@ fpc_evt_cb (FpiDeviceFpcMoc *self,
       break;
 
     case FPC_EVT_FINGER_DWN:
-      fp_dbg ("%s Got finger down event", G_STRFUNC);
+      fp_dbg ("%s Got finger down event (%d)", G_STRFUNC, presp->evt_hdr.status);
       fpi_device_report_finger_status_changes (FP_DEVICE (self),
                                                FP_FINGER_STATUS_PRESENT,
                                                FP_FINGER_STATUS_NONE);
+      if (presp->evt_hdr.status != 0)
+        {
+          /* Redo the current task state if capture failed */
+          fpi_ssm_jump_to_state (self->task_ssm, fpi_ssm_get_cur_state (self->task_ssm));
+          return;
+        }
       break;
 
     case FPC_EVT_IMG:
@@ -737,15 +750,22 @@ fpc_enroll_update_cb (FpiDeviceFpcMoc *self,
       /* here should tips remove finger and try again */
       if (self->max_immobile_stage)
         {
-          if (self->immobile_stage >= self->max_immobile_stage)
+          self->immobile_stage++;
+          if (self->immobile_stage > self->max_immobile_stage)
             {
               fp_dbg ("Skip similar handle due to customer enrollment %d(%d)",
                       self->immobile_stage, self->max_immobile_stage);
               /* Skip too similar handle, treat as normal enroll progress. */
-              fpi_ssm_jump_to_state (self->task_ssm, FPC_ENROL_STATUS_PROGRESS);
+              self->enroll_stage++;
+              fpi_device_enroll_progress (FP_DEVICE (self), self->enroll_stage, NULL, NULL);
+              /* Used for customer enrollment scheme */
+              if (self->enroll_stage >= (self->max_enroll_stage - self->max_immobile_stage))
+                {
+                  fpi_ssm_jump_to_state (self->task_ssm, FP_ENROLL_COMPLETE);
+                  return;
+                }
               break;
             }
-          self->immobile_stage++;
         }
       fpi_device_enroll_progress (FP_DEVICE (self),
                                   self->enroll_stage,
@@ -758,7 +778,10 @@ fpc_enroll_update_cb (FpiDeviceFpcMoc *self,
       fpi_device_enroll_progress (FP_DEVICE (self), self->enroll_stage, NULL, NULL);
       /* Used for customer enrollment scheme */
       if (self->enroll_stage >= (self->max_enroll_stage - self->max_immobile_stage))
-        fpi_ssm_jump_to_state (self->task_ssm, FP_ENROLL_COMPLETE);
+        {
+          fpi_ssm_jump_to_state (self->task_ssm, FP_ENROLL_COMPLETE);
+          return;
+        }
       break;
 
     case FPC_ENROL_STATUS_IMAGE_LOW_COVERAGE:
@@ -1149,12 +1172,9 @@ fpc_enroll_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   fp_info ("Enrollment complete!");
 
-  if (fpi_ssm_get_error (ssm))
-    error = fpi_ssm_get_error (ssm);
-
   if (error)
     {
-      fpi_device_enroll_complete (dev, NULL, error);
+      fpi_device_enroll_complete (dev, NULL, g_steal_pointer (&error));
       self->task_ssm = NULL;
       return;
     }
@@ -1336,9 +1356,6 @@ fpc_verify_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   fp_info ("Verify_identify complete!");
 
-  if (fpi_ssm_get_error (ssm))
-    error = fpi_ssm_get_error (ssm);
-
   if (error && error->domain == FP_DEVICE_RETRY)
     {
       if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
@@ -1348,9 +1365,9 @@ fpc_verify_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
     }
 
   if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
-    fpi_device_verify_complete (dev, error);
+    fpi_device_verify_complete (dev, g_steal_pointer (&error));
   else
-    fpi_device_identify_complete (dev, error);
+    fpi_device_identify_complete (dev, g_steal_pointer (&error));
 
   self->task_ssm = NULL;
 }
@@ -1448,10 +1465,7 @@ fpc_clear_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   fp_info ("Clear Storage complete!");
 
-  if (fpi_ssm_get_error (ssm))
-    error = fpi_ssm_get_error (ssm);
-
-  fpi_device_clear_storage_complete (dev, error);
+  fpi_device_clear_storage_complete (dev, g_steal_pointer (&error));
   self->task_ssm = NULL;
 }
 
@@ -1555,10 +1569,7 @@ fpc_init_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceFpcMoc *self = FPI_DEVICE_FPCMOC (dev);
 
-  if (fpi_ssm_get_error (ssm))
-    error = fpi_ssm_get_error (ssm);
-
-  fpi_device_open_complete (dev, error);
+  fpi_device_open_complete (dev, g_steal_pointer (&error));
   self->task_ssm = NULL;
 }
 
@@ -1630,6 +1641,9 @@ fpc_dev_probe (FpDevice *device)
     case 0xD805:
     case 0xDA04:
     case 0xD205:
+    case 0x9524:
+    case 0x9544:
+    case 0xC844:
       self->max_enroll_stage = MAX_ENROLL_SAMPLES;
       break;
 

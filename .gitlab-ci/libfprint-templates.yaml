@@ -3,6 +3,7 @@
 
 .libfprint_common_variables:
   LIBFPRINT_DEPENDENCIES:
+    appstream
     doxygen
     dnf-plugins-core
     flatpak-builder
@@ -13,15 +14,18 @@
     glib2-devel
     glibc-devel
     gobject-introspection-devel
+    gnome-desktop-testing
     gtk-doc
     gtk3-devel
     libabigail
+    libasan
     libgusb-devel
     libgudev-devel
+    libubsan
     libX11-devel
     libXv-devel
     meson
-    nss-devel
+    openssl-devel
     pixman-devel
     python3-cairo
     python3-gobject
@@ -33,15 +37,11 @@
     diffutils
 
   LIBFPRINT_EXEC: |
-    dnf debuginfo-install -y \
+    dnf -y install dnf-utils
+    debuginfo-install -y \
       glib2 \
       glibc \
       libgusb \
       libusb \
-      nss \
+      openssl \
       pixman
-
-    git clone https://github.com/martinpitt/umockdev.git && \
-        cd umockdev && \
-        meson _build --prefix=/usr && \
-        ninja -C _build && ninja -C _build install

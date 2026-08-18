@@ -128,11 +128,13 @@ fp_cmd_receive_cb (FpiUsbTransfer *transfer,
                    GError         *error)
 {
   FpiDeviceGoodixMoc *self = FPI_DEVICE_GOODIXMOC (device);
+  FpiByteReader reader = {0};
   CommandData *data = user_data;
-  int ret = -1, ssm_state = 0;
+  int ssm_state = 0;
   gxfp_cmd_response_t cmd_reponse = {0, };
   pack_header header;
   guint32 crc32_calc = 0;
+  guint32 crc32 = 0;
   guint16 cmd = 0;
 
   if (error)
@@ -154,8 +156,10 @@ fp_cmd_receive_cb (FpiUsbTransfer *transfer,
       return;
     }
 
-  ret = gx_proto_parse_header (transfer->buffer, transfer->actual_length, &header);
-  if (ret != 0)
+  reader.data = transfer->buffer;
+  reader.size = transfer->actual_length;
+
+  if (gx_proto_parse_header (&reader, &header) != 0)
     {
       fpi_ssm_mark_failed (transfer->ssm,
                            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
@@ -163,8 +167,17 @@ fp_cmd_receive_cb (FpiUsbTransfer *transfer,
       return;
     }
 
+  if (!fpi_byte_reader_set_pos (&reader, PACKAGE_HEADER_SIZE + header.len))
+    {
+      fpi_ssm_mark_failed (transfer->ssm,
+                           fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                     "Package crc read failed"));
+    }
+
   gx_proto_crc32_calc (transfer->buffer, PACKAGE_HEADER_SIZE + header.len, (uint8_t *) &crc32_calc);
-  if(crc32_calc != GUINT32_FROM_LE (*(uint32_t *) (transfer->buffer + PACKAGE_HEADER_SIZE + header.len)))
+
+  if (!fpi_byte_reader_get_uint32_le (&reader, &crc32) ||
+      crc32_calc != crc32)
     {
       fpi_ssm_mark_failed (transfer->ssm,
                            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
@@ -174,8 +187,11 @@ fp_cmd_receive_cb (FpiUsbTransfer *transfer,
 
   cmd = MAKE_CMD_EX (header.cmd0, header.cmd1);
 
-  ret = gx_proto_parse_body (cmd, &transfer->buffer[PACKAGE_HEADER_SIZE], header.len, &cmd_reponse);
-  if (ret != 0)
+  fpi_byte_reader_set_pos (&reader, 0);
+  reader.data = &transfer->buffer[PACKAGE_HEADER_SIZE];
+  reader.size = header.len;
+
+  if (gx_proto_parse_body (cmd, &reader, &cmd_reponse) != 0)
     {
       fpi_ssm_mark_failed (transfer->ssm,
                            fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
@@ -631,20 +647,20 @@ fp_enroll_enum_cb (FpiDeviceGoodixMoc  *self,
       return;
     }
 
-  fpi_ssm_jump_to_state (self->task_ssm, FP_ENROLL_CAPTURE);
+  fpi_ssm_next_state (self->task_ssm);
 }
 
 static void
-fp_enroll_init_cb (FpiDeviceGoodixMoc  *self,
-                   gxfp_cmd_response_t *resp,
-                   GError              *error)
+fp_enroll_create_cb (FpiDeviceGoodixMoc  *self,
+                     gxfp_cmd_response_t *resp,
+                     GError              *error)
 {
   if (error)
     {
       fpi_ssm_mark_failed (self->task_ssm, error);
       return;
     }
-  memcpy (self->template_id, resp->enroll_init.tid, TEMPLATE_ID_SIZE);
+  memcpy (self->template_id, resp->enroll_create.tid, TEMPLATE_ID_SIZE);
   fpi_ssm_next_state (self->task_ssm);
 }
 
@@ -837,16 +853,6 @@ fp_enroll_sm_run_state (FpiSsm *ssm, FpDevice *device)
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
-    case FP_ENROLL_ENUM:
-      {
-        goodix_sensor_cmd (self, MOC_CMD0_GETFINGERLIST, MOC_CMD1_DEFAULT,
-                           false,
-                           (const guint8 *) &dummy,
-                           1,
-                           fp_enroll_enum_cb);
-      }
-      break;
-
     case FP_ENROLL_PWR_BTN_SHIELD_ON:
       {
         goodix_sensor_cmd (self, MOC_CMD0_PWR_BTN_SHIELD, MOC_CMD1_PWR_BTN_SHIELD_ON,
@@ -857,13 +863,23 @@ fp_enroll_sm_run_state (FpiSsm *ssm, FpDevice *device)
       }
       break;
 
+    case FP_ENROLL_ENUM:
+      {
+        goodix_sensor_cmd (self, MOC_CMD0_GETFINGERLIST, MOC_CMD1_DEFAULT,
+                           false,
+                           (const guint8 *) &dummy,
+                           1,
+                           fp_enroll_enum_cb);
+      }
+      break;
+
     case FP_ENROLL_CREATE:
       {
         goodix_sensor_cmd (self, MOC_CMD0_ENROLL_INIT, MOC_CMD1_DEFAULT,
                            false,
                            (const guint8 *) &dummy,
                            1,
-                           fp_enroll_init_cb);
+                           fp_enroll_create_cb);
       }
       break;
 
@@ -1359,16 +1375,26 @@ gx_fp_probe (FpDevice *device)
     {
     case 0x6496:
     case 0x60A2:
+    case 0x60A4:
     case 0x6014:
+    case 0x6092:
     case 0x6094:
+    case 0x609A:
     case 0x609C:
+    case 0x60BC:
+    case 0x60C2:
+    case 0x6304:
     case 0x631C:
+    case 0x633C:
     case 0x634C:
     case 0x6384:
     case 0x639C:
     case 0x63AC:
     case 0x63BC:
     case 0x63CC:
+    case 0x650A:
+    case 0x650C:
+    case 0x6582:
     case 0x6A94:
     case 0x659A:
       self->max_enroll_stage = 12;
@@ -1602,10 +1628,17 @@ fpi_device_goodixmoc_init (FpiDeviceGoodixMoc *self)
 static const FpIdEntry id_table[] = {
   { .vid = 0x27c6,  .pid = 0x5840,  },
   { .vid = 0x27c6,  .pid = 0x6014,  },
+  { .vid = 0x27c6,  .pid = 0x6092,  },
   { .vid = 0x27c6,  .pid = 0x6094,  },
+  { .vid = 0x27c6,  .pid = 0x609A,  },
   { .vid = 0x27c6,  .pid = 0x609C,  },
   { .vid = 0x27c6,  .pid = 0x60A2,  },
+  { .vid = 0x27c6,  .pid = 0x60A4,  },
+  { .vid = 0x27c6,  .pid = 0x60BC,  },
+  { .vid = 0x27c6,  .pid = 0x60C2,  },
+  { .vid = 0x27c6,  .pid = 0x6304,  },
   { .vid = 0x27c6,  .pid = 0x631C,  },
+  { .vid = 0x27c6,  .pid = 0x633C,  },
   { .vid = 0x27c6,  .pid = 0x634C,  },
   { .vid = 0x27c6,  .pid = 0x6384,  },
   { .vid = 0x27c6,  .pid = 0x639C,  },
@@ -1613,6 +1646,9 @@ static const FpIdEntry id_table[] = {
   { .vid = 0x27c6,  .pid = 0x63BC,  },
   { .vid = 0x27c6,  .pid = 0x63CC,  },
   { .vid = 0x27c6,  .pid = 0x6496,  },
+  { .vid = 0x27c6,  .pid = 0x650A,  },
+  { .vid = 0x27c6,  .pid = 0x650C,  },
+  { .vid = 0x27c6,  .pid = 0x6582,  },
   { .vid = 0x27c6,  .pid = 0x6584,  },
   { .vid = 0x27c6,  .pid = 0x658C,  },
   { .vid = 0x27c6,  .pid = 0x6592,  },
@@ -1620,6 +1656,8 @@ static const FpIdEntry id_table[] = {
   { .vid = 0x27c6,  .pid = 0x659A,  },
   { .vid = 0x27c6,  .pid = 0x659C,  },
   { .vid = 0x27c6,  .pid = 0x6A94,  },
+  { .vid = 0x27c6,  .pid = 0x6512,  },
+  { .vid = 0x27c6,  .pid = 0x689A,  },
   { .vid = 0,  .pid = 0,  .driver_data = 0 },   /* terminating entry */
 };
 
