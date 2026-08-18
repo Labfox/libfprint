@@ -7,7 +7,7 @@
 This is an experimental libfprint fork adding drivers for Goodix fingerprint sensors.
 
 - **27c6:55a4** (88×108, TLS) &nbsp;—&nbsp; **working**: enrol, verify & identify via `fprintd`
-- 27c6:5110 (80×64) &nbsp;—&nbsp; in progress
+- 27c6:5110 (80×64) &nbsp;—&nbsp; in progress (upstream, no progress in this fork)
 
 *LibFPrint is part of the **[FPrint][Website]** project.*
 
@@ -23,6 +23,12 @@ This is an experimental libfprint fork adding drivers for Goodix fingerprint sen
 [![Button Contributors]][Contributors]
 
 </div>
+
+## AI Usage
+
+This was mostly made by Claude, with some guidance from me, and testing from me. 
+The code was not reviewed in any way. This works on a Thinkpad E15 Gen 2. 
+There's more info later in this readme on the AI usage, written by claude itself.
 
 ## Status — Goodix `27c6:55a4`
 
